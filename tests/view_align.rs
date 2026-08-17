@@ -90,30 +90,27 @@ fn code_to_bars_and_events(store: &Store, code: &str) -> (Vec<RawBar>, Vec<Adjus
     let mut bars = Vec::new();
     for r in &raw {
         bars.push(RawBar {
-            date: match &r.fields["date"] {
-                Value::Str(s) => s.clone(),
+            date: match r.get("RawDailyBar", "date") {
+                Some(Value::Str(s)) => s.clone(),
                 _ => panic!("date str"),
             },
-            open: f64_of(&r.fields["open"]),
-            high: f64_of(&r.fields["high"]),
-            low: f64_of(&r.fields["low"]),
-            close: f64_of(&r.fields["close"]),
-            volume: f64_of(&r.fields["volume"]),
+            open: f64_of(r.get("RawDailyBar", "open").unwrap()),
+            high: f64_of(r.get("RawDailyBar", "high").unwrap()),
+            low: f64_of(r.get("RawDailyBar", "low").unwrap()),
+            close: f64_of(r.get("RawDailyBar", "close").unwrap()),
+            volume: f64_of(r.get("RawDailyBar", "volume").unwrap()),
         });
     }
     let adj = store.read("AdjustEvent", code).expect("adj");
     let mut events = Vec::new();
     for r in &adj {
-        if r.fields.is_empty() {
-            continue;
-        }
         events.push(AdjustEvent {
-            ex_date: match &r.fields["ex_date"] {
-                Value::Str(s) => s.clone(),
+            ex_date: match r.get("AdjustEvent", "ex_date") {
+                Some(Value::Str(s)) => s.clone(),
                 _ => String::new(),
             },
-            bonus_per_share: f64_of(&r.fields["bonus_per_share"]),
-            cash_per_share: f64_of(&r.fields["cash_per_share"]),
+            bonus_per_share: f64_of(r.get("AdjustEvent", "bonus_per_share").unwrap()),
+            cash_per_share: f64_of(r.get("AdjustEvent", "cash_per_share").unwrap()),
         });
     }
     (bars, events)

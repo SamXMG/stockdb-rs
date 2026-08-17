@@ -100,13 +100,18 @@ JSON：`{ "cal_len": usize, "cal_hash": str, "table": str }`。
 
 ## 兼容性测试
 
-仓库内含三类对齐测试，均以 Python `stockdb` 为基准（`testdata/` 由 Python 落盘 3 只票）：
+所有读写 / 视图逻辑均有「Rust 输出 vs Python 读回」的字节级对齐测试，作为跨语言契约的回归保护。
+基准数据 `testdata/` 由 `tests/gen_testdata.py`（调用本地 `Screener/stockdb` 的 `engine`）落盘，
+覆盖全部 8 张列式表（RawDailyBar / FundFlow / AdjustEvent / IndexDaily / CompanyProfile / Announcement / RenameEvent / DailySnapshot）。
 
-- `tests/align_with_python.rs` — 读路径字节/字段级对齐（RawDailyBar / CompanyProfile / AdjustEvent）
+- `tests/align_with_python.rs` — 读路径逐表字段级对齐（8 表）
 - `tests/view_align.rs` — 视图数值对齐（qfq / hfq / weekly / monthly）
 - `tests/write_align.rs` — 写路径对齐（Rust 写 → Python 读回一致；repack；.meta）
 
 ```bash
+# 1) (可选) 重新生成基准数据
+python3 tests/gen_testdata.py testdata /path/to/Screener
+# 2) 运行全部对齐测试
 cargo test
 ```
 

@@ -67,7 +67,8 @@ fn cmp_records(rust: &[stockdb_rs::Record], py: &[HashMap<String, serde_json::Va
     assert_eq!(rust.len(), py.len(), "len mismatch {ctx}");
     for (r, p) in rust.iter().zip(py.iter()) {
         assert_eq!(r.t, p["t"].as_i64().unwrap(), "t mismatch {ctx}");
-        for (k, v) in &r.fields {
+        for (i, v) in r.fields.iter().enumerate() {
+            let k = &r.layout[i].0;
             let pv = &p[k];
             match v {
                 Value::Str(s) => assert_eq!(s, pv.as_str().unwrap_or(""), "str {k} {ctx}"),
@@ -95,8 +96,18 @@ fn write_then_read_by_python() {
     let src_store = Store::open(&src).unwrap();
     let out_store = Store::open(&tmp).unwrap();
 
-    for table in ["RawDailyBar", "CompanyProfile", "AdjustEvent"] {
-        for code in ["600000", "000001", "300750"] {
+    let cases: &[(&str, &[&str])] = &[
+        ("RawDailyBar", &["600000", "000001", "300750"]),
+        ("CompanyProfile", &["600000", "000001", "300750"]),
+        ("AdjustEvent", &["600000", "000001", "300750"]),
+        ("FundFlow", &["600000", "000001", "300750"]),
+        ("IndexDaily", &["000001", "399001"]),
+        ("Announcement", &["600000", "000001", "300750"]),
+        ("RenameEvent", &["600000"]),
+        ("DailySnapshot", &["600000", "000001", "300750"]),
+    ];
+    for (table, codes) in cases {
+        for code in *codes {
             if !src_store.exists(table, code) {
                 continue;
             }

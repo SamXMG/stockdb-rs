@@ -4,8 +4,6 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde_json::Value as Json;
-
 #[derive(Debug, Clone)]
 pub struct TradingCalendar {
     dates: Vec<String>,
@@ -14,24 +12,14 @@ pub struct TradingCalendar {
 
 impl TradingCalendar {
     /// 从 `calendar.json` 加载（纯字符串数组）。
+    /// 使用强类型 `Vec<String>` 解析，避免 `serde_json::Value` 动态开销。
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let txt = std::fs::read_to_string(path)?;
-        let parsed: Json = serde_json::from_str(&txt)
+        let arr: Vec<String> = serde_json::from_str(&txt)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let arr = parsed
-            .as_array()
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "calendar not array")
-            })?;
         let mut dates = Vec::with_capacity(arr.len());
         let mut index = HashMap::with_capacity(arr.len());
-        for (i, v) in arr.iter().enumerate() {
-            let d = v
-                .as_str()
-                .ok_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "date not string")
-                })?
-                .to_string();
+        for (i, d) in arr.into_iter().enumerate() {
             index.insert(d.clone(), i);
             dates.push(d);
         }

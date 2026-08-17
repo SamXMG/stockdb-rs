@@ -78,6 +78,8 @@ pub const TABLE_FIELDS: &[(&str, &[&str])] = &[
     ]),
 ];
 
+use std::collections::HashMap;
+
 /// 字段类型分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FieldKind {
@@ -146,15 +148,30 @@ pub enum Value {
     Null, // present=0 或 NaN
 }
 
-/// 一行解码结果（保序），可直接对称编码回字节。
+/// 一行解码结果（列式，与 schema 声明顺序一致），可直接对称编码回字节。
+///
+/// 为极致性能，`fields` 采用**列式定长 `Vec<Value>`**：第 `i` 个槽位对应
+/// `field_kinds(table)[i]` 的字段，下标定位 O(1)，无字符串 key 散列与堆分配。
+/// 字段名索引由 `field_index(table)` 提供。
 #[derive(Debug, Clone, Default)]
 pub struct Record {
     pub t: i64,
-    /// 字段名 -> 值（保序，与 schema 声明顺序一致）。
-    pub fields: Vec<(String, Value)>,
+    /// 字段值，按 schema 顺序排列（与 `field_kinds` 下标一致）。
+    pub fields: Vec<Value>,
     /// 编码所需的字段布局：(字段名, format_char) 序列。
     /// 仅在 `decode_row` 解码出的 Record 上填充，用于对称 `encode_row`。
     pub layout: Vec<(String, char)>,
+}
+
+/// 字段名 -> 在 `Record.fields` / `field_kinds` 中的下标。
+/// 供列式访问按名定位（仅在需要时调用，热路径建议直接按下标）。
+pub fn field_index(table: &str) -> Option<HashMap<String, usize>> {
+    let fields = TABLE_FIELDS.iter().find(|(t, _)| *t == table)?.1;
+    let mut m = HashMap::with_capacity(fields.len());
+    for (i, f) in fields.iter().enumerate() {
+        m.insert((*f).to_string(), i);
+    }
+    Some(m)
 }
 
 /// 解码单行（含 present 判断），返回保序 `Record`。
@@ -170,6 +187,7 @@ pub fn decode_row(table: &str, buf: &[u8]) -> Option<Record> {
     }
     let mut off = 1usize;
     let mut rec = Record::default();
+    rec.fields.reserve(kinds.len());
     for (name, kind) in kinds {
         let v = match kind {
             FieldKind::Bool => {
@@ -178,13 +196,13 @@ pub fn decode_row(table: &str, buf: &[u8]) -> Option<Record> {
                 Value::Bool(b != 0)
             }
             FieldKind::Str(w) => {
-                let s = String::from_utf8_lossy(&buf[off..off + w])
-                    .split('\0')
-                    .next()
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
+                // 零拷贝友好：先按 \0 截断再 trim，避免扫描整段后多余分配。
+                let raw = &buf[off..off + w];
                 off += w;
+                let end = raw.iter().position(|&c| c == 0).unwrap_or(w);
+                let s = std::str::from_utf8(&raw[..end])
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default();
                 Value::Str(s)
             }
             FieldKind::T => {
@@ -212,7 +230,7 @@ pub fn decode_row(table: &str, buf: &[u8]) -> Option<Record> {
             }
         }
         rec.layout.push((name.clone(), format_char(&kind)));
-        rec.fields.push((name, v));
+        rec.fields.push(v);
     }
     Some(rec)
 }
@@ -275,7 +293,7 @@ pub fn encode_row(rec: &Record) -> Vec<u8> {
         .collect();
     let mut out = Vec::with_capacity(record_len_of(&kinds));
     out.push(1u8); // present
-    for ((_, v), k) in rec.fields.iter().zip(kinds.iter()) {
+    for (v, k) in rec.fields.iter().zip(kinds.iter()) {
         encode_value(&mut out, v, k);
     }
     out
