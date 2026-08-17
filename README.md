@@ -125,8 +125,17 @@ src/
   layout.rs     二进制编码契约 + decode/encode（与 Python 1:1）
   calendar.rs   交易日历加载 + hash 指纹
   view.rs       数据库视图：复权 / 周期聚合
+  minute.rs     MinuteBar 分时块（独立 JSON 格式, 与 Python MinuteStore 兼容）
 tests/          与 Python 的跨语言对齐测试
 ```
+
+### 两张存储体系
+
+- **列式定长 `.dat`**（`ColumnStore` / `Store`）：RawDailyBar / FundFlow / AdjustEvent /
+  IndexDaily / CompanyProfile / Announcement / RenameEvent / DailySnapshot，全部 8 表
+  均与 Python 字节级对齐。
+- **分时 JSON 块**（`MinuteStore` / `minute::MinuteStore`）：每个 `(code, date)` 一块，存于
+  `root/minute/{code}/{date}.min`，字段与 Python `schema.MinuteBar` 一致。
 
 ## License
 

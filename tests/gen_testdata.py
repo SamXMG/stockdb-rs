@@ -75,4 +75,21 @@ for code in codes:
         flow_l=-3e7, flow_l_pct=-0.9, industry="银行", concepts="沪股通;融资融券")]
     store.write("DailySnapshot", code, rows)
 
-print("generated:", [t for t in ["FundFlow","IndexDaily","Announcement","RenameEvent","DailySnapshot"]])
+# MinuteBar: 分时独立 JSON 块 (MinuteStore)
+mstore = engine.MinuteStore(ROOT)
+for code in codes:
+    d = dates[1]
+    n = 48
+    mb = schema.MinuteBar(
+        code=code, date=d,
+        minutes=list(range(n)),
+        opens=[10.0 + i * 0.1 for i in range(n)],
+        highs=[10.5 + i * 0.1 for i in range(n)],
+        lows=[9.8 + i * 0.1 for i in range(n)],
+        closes=[10.2 + i * 0.1 for i in range(n)],
+        volumes=[1000.0 + i for i in range(n)],
+        amounts=[1e6 + i * 100.0 for i in range(n)],
+    )
+    mstore.write(mb)
+
+print("generated:", [t for t in ["FundFlow","IndexDaily","Announcement","RenameEvent","DailySnapshot","MinuteBar"]])

@@ -12,6 +12,7 @@
 pub mod calendar;
 pub mod ffi;
 pub mod layout;
+pub mod minute;
 pub mod view;
 
 use std::collections::HashMap;
