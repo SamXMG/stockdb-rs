@@ -2,9 +2,12 @@
 name = "stockdb-rs"
 version = "0.1.0"
 edition = "2021"
-description = "A股列式存储数据库: 定长二进制 + 全局交易日历 t 对齐 + mmap 零拷贝随机读"
+description = "A股列式存储数据库: 定长二进制 + 全局交易日历 t 对齐 + mmap 零拷贝随机读 (与 Python stockdb 二进制兼容)"
 license = "MIT OR Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/your-org/stockdb-rs"
+keywords = ["stock", "timeseries", "columnar", "a-share", "database"]
+categories = ["database-implementations", "finance"]
 
 [dependencies]
 memmap2 = "0.9"
