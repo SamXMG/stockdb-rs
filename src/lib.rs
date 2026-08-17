@@ -6,6 +6,7 @@
 
 pub mod calendar;
 pub mod layout;
+pub mod view;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
