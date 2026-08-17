@@ -1,0 +1,63 @@
+//! 交易日历 —— 与 Python `stockdb/calendar.py` 的 JSON 数组格式兼容。
+//! `calendar.json` 是紧凑 JSON 字符串数组: ["2023-07-14","2023-07-17",...]
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use serde_json::Value as Json;
+
+#[derive(Debug, Clone)]
+pub struct TradingCalendar {
+    dates: Vec<String>,
+    index: HashMap<String, usize>,
+}
+
+impl TradingCalendar {
+    /// 从 `calendar.json` 加载（纯字符串数组）。
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let txt = std::fs::read_to_string(path)?;
+        let parsed: Json = serde_json::from_str(&txt)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let arr = parsed
+            .as_array()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "calendar not array")
+            })?;
+        let mut dates = Vec::with_capacity(arr.len());
+        let mut index = HashMap::with_capacity(arr.len());
+        for (i, v) in arr.iter().enumerate() {
+            let d = v
+                .as_str()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "date not string")
+                })?
+                .to_string();
+            index.insert(d.clone(), i);
+            dates.push(d);
+        }
+        Ok(Self { dates, index })
+    }
+
+    pub fn len(&self) -> usize {
+        self.dates.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dates.is_empty()
+    }
+
+    /// date -> t (全局交易日索引)。找不到返回 None。
+    pub fn date_to_t(&self, d: &str) -> Option<usize> {
+        self.index.get(d).copied()
+    }
+
+    /// t -> date。越界返回 None。
+    pub fn t_to_date(&self, t: usize) -> Option<&str> {
+        self.dates.get(t).map(|s| s.as_str())
+    }
+
+    /// 安全版: 找不到返回 default。
+    pub fn get_t(&self, d: &str, default: i64) -> i64 {
+        self.index.get(d).map(|t| *t as i64).unwrap_or(default)
+    }
+}

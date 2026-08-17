@@ -1,0 +1,10 @@
+# Rust / cargo
+/target
+**/*.rs.bk
+Cargo.lock
+
+# 本地测试数据(二进制列式文件, 不入库)
+/testdata/
+*.dat
+*.meta
+*.json
