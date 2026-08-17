@@ -60,4 +60,18 @@ impl TradingCalendar {
     pub fn get_t(&self, d: &str, default: i64) -> i64 {
         self.index.get(d).map(|t| *t as i64).unwrap_or(default)
     }
+
+    /// 日历指纹 (与 Python `Calendar.hash` 一致)。
+    /// `md5(f"{first}|{last}|{len}")[:12]`，截断为 12 位十六进制串。
+    pub fn hash(&self) -> String {
+        use md5::{Digest, Md5};
+        let first = self.dates.first().map(|s| s.as_str()).unwrap_or("");
+        let last = self.dates.last().map(|s| s.as_str()).unwrap_or("");
+        let s = format!("{}|{}|{}", first, last, self.dates.len());
+        let mut h = Md5::new();
+        h.update(s.as_bytes());
+        let digest = h.finalize();
+        let hex = format!("{:x}", digest);
+        hex.chars().take(12).collect()
+    }
 }

@@ -8,8 +8,6 @@
 //!   - `t` 字段：`q` (i64，全局交易日索引)
 //!   - 其余数值：`d` (f64，空值用 NaN 占位)
 
-use std::collections::HashMap;
-
 /// 各字符串字段宽度（字节），与 Python `_STR_W` 一致。
 pub const STR_W: &[(&str, usize)] = &[
     ("code", 16), ("index_code", 16), ("date", 10), ("ex_date", 10),
@@ -148,9 +146,20 @@ pub enum Value {
     Null, // present=0 或 NaN
 }
 
-/// 解码单行（含 present 判断）。`buf` 长度须等于 `record_len(table)`。
-/// 返回 `None` 表示该槽为空（present=0）。
-pub fn decode_row(table: &str, buf: &[u8]) -> Option<HashMap<String, Value>> {
+/// 一行解码结果（保序），可直接对称编码回字节。
+#[derive(Debug, Clone, Default)]
+pub struct Record {
+    pub t: i64,
+    /// 字段名 -> 值（保序，与 schema 声明顺序一致）。
+    pub fields: Vec<(String, Value)>,
+    /// 编码所需的字段布局：(字段名, format_char) 序列。
+    /// 仅在 `decode_row` 解码出的 Record 上填充，用于对称 `encode_row`。
+    pub layout: Vec<(String, char)>,
+}
+
+/// 解码单行（含 present 判断），返回保序 `Record`。
+/// `buf` 长度须等于 `record_len(table)`。返回 `None` 表示该槽为空（present=0）。
+pub fn decode_row(table: &str, buf: &[u8]) -> Option<Record> {
     let kinds = field_kinds(table)?;
     let rlen = record_len(table)?;
     if buf.len() < rlen {
@@ -160,7 +169,7 @@ pub fn decode_row(table: &str, buf: &[u8]) -> Option<HashMap<String, Value>> {
         return None; // 空槽
     }
     let mut off = 1usize;
-    let mut map = HashMap::new();
+    let mut rec = Record::default();
     for (name, kind) in kinds {
         let v = match kind {
             FieldKind::Bool => {
@@ -197,9 +206,111 @@ pub fn decode_row(table: &str, buf: &[u8]) -> Option<HashMap<String, Value>> {
             }
             FieldKind::Present => unreachable!(),
         };
-        map.insert(name, v);
+        if name == "t" {
+            if let Value::I64(t) = &v {
+                rec.t = *t;
+            }
+        }
+        rec.layout.push((name.clone(), format_char(&kind)));
+        rec.fields.push((name, v));
     }
-    Some(map)
+    Some(rec)
+}
+
+/// 字段类型 -> struct format char（与 Python `_build_layout` 一致）。
+fn format_char(kind: &FieldKind) -> char {
+    match kind {
+        FieldKind::Bool => '?',
+        FieldKind::Str(_) => 's',
+        FieldKind::T => 'q',
+        FieldKind::F64 => 'd',
+        FieldKind::Present => '?',
+    }
+}
+
+/// 将单个 `Value` 编码为字节（不含 present 标记），写入 `out`。
+/// `kind` 决定宽度与编码方式，与 `decode_row` 完全对称。
+fn encode_value(out: &mut Vec<u8>, v: &Value, kind: &FieldKind) {
+    match (kind, v) {
+        (FieldKind::Bool, Value::Bool(b)) => {
+            out.push(if *b { 1 } else { 0 });
+        }
+        (FieldKind::Str(w), Value::Str(s)) => {
+            let mut b = s.as_bytes().to_vec();
+            if b.len() > *w {
+                b.truncate(*w); // 右截断
+            } else {
+                b.resize(*w, 0); // 右补 \x00
+            }
+            out.extend_from_slice(&b);
+        }
+        (FieldKind::T, Value::I64(i)) => {
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        (FieldKind::T, Value::Null) => {
+            out.extend_from_slice(&0i64.to_le_bytes());
+        }
+        (FieldKind::F64, Value::F64(f)) => {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+        (FieldKind::F64, Value::Null) => {
+            out.extend_from_slice(&f64::NAN.to_le_bytes());
+        }
+        // 缺失/类型不匹配时按空值兜底
+        (FieldKind::Bool, _) => out.push(0),
+        (FieldKind::Str(w), _) => out.extend_from_slice(&vec![0u8; *w]),
+        (FieldKind::F64, _) => out.extend_from_slice(&f64::NAN.to_le_bytes()),
+        (FieldKind::T, _) => out.extend_from_slice(&0i64.to_le_bytes()),
+        (FieldKind::Present, _) => unreachable!(),
+    }
+}
+
+/// 将 `Record` 编码为一行定长字节（含首字节 present=1）。
+/// 与 `decode_row` 对称；可直接落盘。
+pub fn encode_row(rec: &Record) -> Vec<u8> {
+    let kinds: Vec<FieldKind> = rec
+        .layout
+        .iter()
+        .map(|(name, c)| kind_from_char(c, name))
+        .collect();
+    let mut out = Vec::with_capacity(record_len_of(&kinds));
+    out.push(1u8); // present
+    for ((_, v), k) in rec.fields.iter().zip(kinds.iter()) {
+        encode_value(&mut out, v, k);
+    }
+    out
+}
+
+/// 按字段布局计算 record 字节长度。
+fn record_len_of(kinds: &[FieldKind]) -> usize {
+    let mut n = 1usize;
+    for k in kinds {
+        n += match k {
+            FieldKind::Bool => 1,
+            FieldKind::Str(w) => *w,
+            FieldKind::T | FieldKind::F64 => 8,
+            FieldKind::Present => 1,
+        };
+    }
+    n
+}
+
+/// layout 中的 's' 需要解析真实宽度；这里用全局 STR_W + 字段名反查。
+fn kind_from_char(c: &char, name: &str) -> FieldKind {
+    match c {
+        '?' => FieldKind::Bool,
+        'q' => FieldKind::T,
+        'd' => FieldKind::F64,
+        's' => {
+            let w = STR_W
+                .iter()
+                .find(|(s, _)| *s == name)
+                .map(|(_, w)| *w)
+                .unwrap_or(0);
+            FieldKind::Str(w)
+        }
+        _ => FieldKind::F64,
+    }
 }
 
 #[cfg(test)]
