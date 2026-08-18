@@ -24,24 +24,48 @@ __all__ = ["StockDB", "StockDBError"]
 # 参考「调用端适配接口」用 layout：(字段名, 类型元字符, 字节宽)。
 # 来源 = CONTRACT.md §3（字段类型表）。仅登记常用表作示例；
 # 其它表请按 §3 自行提供后调用 decode_rows，或直接按偏移零拷贝解码。
-# 价格类列已改为缩放整数 `I`（4 字节 i32，读时 ÷SCALE 还原），见 §3 / §4.2。
+# 价格类列与百分比/比率类列已改为缩放整数 `I`（4 字节 i32，读时 ÷SCALE 还原），见 §3 / §4.2。
 _KNOWN_LAYOUTS = {
     "RawDailyBar": [
         ("code", "s", 16), ("t", "q", 8), ("date", "s", 10),
         ("open", "I", 4), ("high", "I", 4), ("low", "I", 4), ("close", "I", 4),
-        ("volume", "d", 8), ("amount", "d", 8), ("turnover", "d", 8),
+        ("volume", "d", 8), ("amount", "d", 8), ("turnover", "I", 4),
     ],
     "IndexDaily": [
         ("index_code", "s", 16), ("t", "q", 8), ("date", "s", 10),
         ("open", "I", 4), ("high", "I", 4), ("low", "I", 4), ("close", "I", 4),
         ("volume", "d", 8), ("amount", "d", 8),
     ],
+    "FundFlow": [
+        ("code", "s", 16), ("t", "q", 8), ("date", "s", 10),
+        ("main_net", "d", 8), ("main_pct", "I", 4), ("xl_net", "d", 8),
+        ("xl_pct", "I", 4), ("l_net", "d", 8), ("l_pct", "I", 4),
+        ("mid_net", "d", 8), ("mid_pct", "I", 4), ("small_net", "d", 8),
+        ("small_pct", "I", 4),
+    ],
+    "DailySnapshot": [
+        ("code", "s", 16), ("date", "s", 10), ("t", "q", 8), ("name", "s", 32),
+        ("board", "s", 16), ("is_st", "?", 1), ("price", "I", 4),
+        ("prev_close", "I", 4), ("chg_pct", "I", 4), ("vol_ratio", "I", 4),
+        ("turnover", "I", 4), ("market_cap_yi", "d", 8), ("float_cap_yi", "d", 8),
+        ("pe", "I", 4), ("pb", "I", 4), ("chg60", "I", 4), ("flow_main", "d", 8),
+        ("flow_main_pct", "I", 4), ("flow_xl", "d", 8), ("flow_xl_pct", "I", 4),
+        ("flow_l", "d", 8), ("flow_l_pct", "I", 4), ("industry", "s", 24),
+        ("concepts", "s", 192),
+    ],
 }
 
 # 缩放整数列：磁盘 i32（×scale 写入），读时 ÷scale 还原。与 Rust `layout::SCALED` 一致。
 SCALE = {
+    # 价格类（2 位小数 → ×100）
     "open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0,
     "prev_close": 100.0, "price": 100.0,
+    # 百分比/比率类（4 位小数 → ×10000）
+    "turnover": 10000.0, "chg_pct": 10000.0, "vol_ratio": 10000.0,
+    "chg60": 10000.0, "pe": 10000.0, "pb": 10000.0,
+    "flow_main_pct": 10000.0, "flow_xl_pct": 10000.0, "flow_l_pct": 10000.0,
+    "main_pct": 10000.0, "xl_pct": 10000.0, "l_pct": 10000.0,
+    "mid_pct": 10000.0, "small_pct": 10000.0,
 }
 _SCALED_NULL = -(2 ** 31)  # i32::MIN，与 Rust `layout::SCALED_NULL` 一致
 
@@ -242,7 +266,7 @@ class StockDB:
             off += 1
             rec = {}
             for (name, kind, width) in layout:
-                if kind == "b":
+                if kind in ("b", "?"):  # bool（CONTRACT 元字符 `?`）
                     rec[name] = bool(buf[off])
                     off += 1
                 elif kind == "s":

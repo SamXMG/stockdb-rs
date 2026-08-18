@@ -95,14 +95,33 @@ pub enum FieldKind {
 pub const SCALED_NULL: i32 = i32::MIN;
 
 /// 缩放整数列的「字段名 → 缩放因子」。命中则磁盘存 i32（4 字节），否则按 f64（8 字节）。
-/// 仅纳入数值范围安全的字段（价格类 2 位小数 → 100）；成交量/成交额等可能溢出的保持 f64。
+/// 仅纳入数值范围安全的字段：
+///   - 价格类（元，2 位小数）→ 100（open/high/low/close/prev_close/price）；
+///   - 百分比/比率类（4 位小数）→ 10000（turnover/chg_pct/vol_ratio/chg60/pe/pb/*_pct 等）。
+/// 成交量/成交额/净流入等大数量级字段可能溢出 i32（`f*scale` 超出 ±2.14e9），保持 f64。
 pub const SCALED: &[(&str, f64)] = &[
+    // 价格类（2 位小数 → ×100）
     ("open", 100.0),
     ("high", 100.0),
     ("low", 100.0),
     ("close", 100.0),
     ("prev_close", 100.0),
     ("price", 100.0),
+    // 百分比/比率类（4 位小数 → ×10000）
+    ("turnover", 10000.0),
+    ("chg_pct", 10000.0),
+    ("vol_ratio", 10000.0),
+    ("chg60", 10000.0),
+    ("pe", 10000.0),
+    ("pb", 10000.0),
+    ("flow_main_pct", 10000.0),
+    ("flow_xl_pct", 10000.0),
+    ("flow_l_pct", 10000.0),
+    ("main_pct", 10000.0),
+    ("xl_pct", 10000.0),
+    ("l_pct", 10000.0),
+    ("mid_pct", 10000.0),
+    ("small_pct", 10000.0),
 ];
 
 fn scaled_scale_of(name: &str) -> Option<f64> {
@@ -492,7 +511,14 @@ mod tests {
     fn record_lens_canonical() {
         // 实测字节长度：801 行 × rlen == 72891 ⇒ rlen == 91
         // 801 * rlen == 72891 => rlen == 91
-        assert_eq!(record_len("RawDailyBar"), Some(75));
+        // RawDailyBar: 价格列(open/high/low/close) + turnover 缩放 → 71
+        assert_eq!(record_len("RawDailyBar"), Some(71));
+        // IndexDaily: 价格列缩放 → 67
+        assert_eq!(record_len("IndexDaily"), Some(67));
+        // FundFlow: 5 个 *_pct 缩放 → 95
+        assert_eq!(record_len("FundFlow"), Some(95));
+        // DailySnapshot: price/prev_close + 9 个百分比/比率列缩放 → 384
+        assert_eq!(record_len("DailySnapshot"), Some(384));
         // CompanyProfile: 303579 / 801 = 379
         assert_eq!(record_len("CompanyProfile"), Some(379));
         // AdjustEvent: 47259 / 801 = 59

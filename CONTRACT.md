@@ -175,7 +175,7 @@ func_call := name '(' arg (',' arg)* ')'                 // 见 §2.2 / 标量�
 ```
 偏移      字段           类型      说明
 [0..4]    magic          u32       0x53544231 ("STB1")，校验魔数
-[4..8]    record_len     u32       单行字节数（= §3.4，如 RawDailyBar=91）
+[4..8]    record_len     u32       单行字节数（= §3.4，如 RawDailyBar=71）
 [8..16]   n_hits         u64       命中行数
 [16..24]  schema_hash    u64       字段布局指纹（= stockdb_schema_hash(table)）
 [24..]    rows           bytes     n_hits × record_len，每行即 §4 定长 stride 编码
@@ -263,10 +263,13 @@ summary=128, url=64, reason=64, note=64, concepts=192
 
 已对 Python `struct.calcsize` 实测对齐：
 
-- `RawDailyBar` = 75（价格列 open/high/low/close 改为 4 字节缩放整数 `I`）
+- `RawDailyBar` = 71（价格列 open/high/low/close + turnover 改为 4 字节缩放整数 `I`）
+- `IndexDaily` = 67（价格列 open/high/low/close 改为 `I`）
+- `FundFlow` = 95（5 个 `*_pct` 改为 `I`）
+- `DailySnapshot` = 384（price/prev_close + 9 个百分比/比率列改为 `I`）
 - `CompanyProfile` = 379（未缩放）
 - `AdjustEvent` = 59（未缩放）
-- 其余各表按 §3.1 字段序列 + §3.2/§3.3 宽度累加（公式见 §4.1）；价格类列按 `I`(4B) 计，其余数值按 `d`(8B)。
+- 其余各表按 §3.1 字段序列 + §3.2/§3.3 宽度累加（公式见 §4.1）；缩放列按 `I`(4B) 计，其余数值按 `d`(8B)。
 
 ---
 
@@ -299,7 +302,8 @@ summary=128, url=64, reason=64, note=64, concepts=192
   - `t`：`q`，i64 全局交易日索引。
   - 其余数值：`d`，f64；**空值用 `f64::NAN` 占位**。
   - 缩放整数：`I`，i32（4 字节）；写时 `(f64 × scale).round()`、读时 `÷ scale` 还原；
-    **空值用哨兵 `i32::MIN` 占位**（见 §3 类型表）；仅价格类列（2 位小数，scale=100）启用。
+    **空值用哨兵 `i32::MIN` 占位**（见 §3 类型表）；价格类列（2 位小数，scale=100）与
+    百分比/比率类列（4 位小数，scale=10000）启用，字段清单见 `layout::SCALED`（Rust 侧常量）。
 - `encode_row`（`layout.rs`）与 `decode_row` 完全对称，可直接落盘 / 回读。
 
 ### 4.3 交易日历 `calendar.json`
@@ -319,7 +323,7 @@ summary=128, url=64, reason=64, note=64, concepts=192
 - **稳定承诺（变更须 MAJOR 版本）**：C ABI 函数签名、§2 JSON schema、§3/§4 磁盘字节布局与字段表。这些是跨语言契约，不可破坏性变更。
 - 字段**新增**通常向后兼容（旧文件多出的字段按 `null`/`NaN` 处理），但字段**重排 / 改名 / 改宽度**属破坏性变更。
 - 参考实现 Python `stockdb` 与本文 1:1；任何偏离以本文 + `layout.rs` 常量为准。
-- 本次格式演进：价格类列（open/high/low/close/prev_close/price）由 `d`(f64,8B) 改为 `I`(缩放整数,4B)，属破坏性变更，须升 MAJOR 版本并提供 `.dat` 迁移；既有数据须重新写入。
+- 本次格式演进：价格类列（open/high/low/close/prev_close/price，scale=100）与百分比/比率类列（turnover/chg_pct/vol_ratio/chg60/pe/pb/*_pct 等，scale=10000）由 `d`(f64,8B) 改为 `I`(缩放整数,4B)，属破坏性变更，须升 MAJOR 版本并提供 `.dat` 迁移；既有数据须重新写入。
 - 仓库内含「Rust 输出 vs 参考实现回读」的字节级对齐测试，作为契约回归保护——修改 §3/§4 须同步更新。
 
 ---
