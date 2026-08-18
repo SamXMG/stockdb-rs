@@ -56,6 +56,7 @@ print(json.dumps(bar.__dict__ if hasattr(bar, "__dict__") else {}))
             closes: v["closes"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect()).unwrap_or_default(),
             volumes: v["volumes"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect()).unwrap_or_default(),
             amounts: v["amounts"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect()).unwrap_or_default(),
+            avgs: v["avgs"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect()).unwrap_or_default(),
         })
         .expect("parse python MinuteBar")
 }
@@ -97,6 +98,7 @@ fn sample(code: &str, date: &str, n: usize) -> MinuteBar {
         closes: minutes.iter().map(|m| 10.2 + m * 0.1).collect(),
         volumes: minutes.iter().map(|m| 1000.0 + m).collect(),
         amounts: minutes.iter().map(|m| 1e6 + m * 100.0).collect(),
+        avgs: minutes.iter().map(|m| 9.9 + m * 0.05).collect(),
     }
 }
 
@@ -124,6 +126,9 @@ fn eq(a: &MinuteBar, b: &MinuteBar) {
     }
     for (x, y) in a.amounts.iter().zip(b.amounts.iter()) {
         assert!((x - y).abs() < 1e-9, "amounts {x} {y}");
+    }
+    for (x, y) in a.avgs.iter().zip(b.avgs.iter()) {
+        assert!((x - y).abs() < 1e-9, "avgs {x} {y}");
     }
 }
 

@@ -103,11 +103,16 @@ pub struct Store {
 }
 
 impl Store {
-    /// 打开根目录, 加载 `calendar.json`。
+    /// 打开根目录, 加载 `calendar.json`；目录或日历缺失时按空库处理（首次打开即写入场景）。
     pub fn open<P: AsRef<Path>>(root: P) -> std::io::Result<Self> {
         let root = root.as_ref().to_path_buf();
+        std::fs::create_dir_all(&root)?;
         let cal_path = root.join("calendar.json");
-        let cal = TradingCalendar::load(&cal_path)?;
+        let cal = if cal_path.exists() {
+            TradingCalendar::load(&cal_path)?
+        } else {
+            TradingCalendar::empty()
+        };
         Ok(Self {
             root,
             cal: RwLock::new(cal),

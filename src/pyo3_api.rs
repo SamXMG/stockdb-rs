@@ -9,15 +9,20 @@
 //! 与 Python 参考实现 `ColumnStore.read` 同构；i32 缩放列由 Rust 侧已还原为 f64，无需 Python 处理。
 #![cfg(feature = "pyo3")]
 
-use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::exceptions::{PyIOError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyDictMethods};
+use pyo3::types::{PyBytes, PyDict, PyDictMethods, PyList, PyListMethods};
+use std::sync::Arc;
 
-use crate::{Store, Value};
+use crate::layout::FieldKind;
+use crate::minute::{MinuteBar, MinuteStore};
+use crate::{Record, Store, Value};
+use std::path::PathBuf;
 
 #[pyclass]
 pub struct StockDB {
     inner: Store,
+    root: PathBuf,
 }
 
 #[pymethods]
@@ -25,7 +30,10 @@ impl StockDB {
     #[new]
     fn new(root: &str) -> PyResult<Self> {
         Store::open(root)
-            .map(|s| StockDB { inner: s })
+            .map(|s| StockDB {
+                inner: s,
+                root: PathBuf::from(root),
+            })
             .map_err(|e| PyErr::new::<PyIOError, _>(format!("stockdb open failed: {e}")))
     }
 
@@ -109,9 +117,85 @@ impl StockDB {
         self.inner.calendar().len()
     }
 
+    /// 写入一组记录（覆盖写，按 `date` 幂等 upsert；缺失日期保留旧值）。
+    ///
+    /// `rows`: `list[dict]`，每个 dict 键为 §3.1 字段名。数值列支持 int/float，
+    /// 缺失键或 None 视为空值（Null/NaN）。`date` 必填（用于计算全局交易日索引 t）。
+    /// 缩放整数列（价格/百分比）由内核按 CONTRACT 自动 ×scale 编码，调用方传入真实 f64 即可。
+    /// 返回写入后的目标长度 n。
+    fn write(
+        &self,
+        py: Python<'_>,
+        table: &str,
+        code: &str,
+        rows: &Bound<PyList>,
+    ) -> PyResult<usize> {
+        let kinds = crate::layout::field_kinds(table)
+            .ok_or_else(|| PyValueError::new_err(format!("unknown table: {table}")))?;
+        let layout: Arc<[(String, char)]> = kinds
+            .iter()
+            .map(|(n, k)| (n.clone(), crate::layout::format_char(k)))
+            .collect();
+        let mut records: Vec<Record> = Vec::with_capacity(rows.len());
+        for row_obj in rows.iter() {
+            let dict = row_obj
+                .downcast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err("each row must be a dict"))?;
+            let mut fields: Vec<Value> = Vec::with_capacity(kinds.len());
+            let mut date = String::new();
+            for (name, kind) in &kinds {
+                let val = match dict.get_item(name) {
+                    Ok(Some(item)) => pyobj_to_value(&item, *kind)?,
+                    _ => Value::Null,
+                };
+                if name == "date" {
+                    if let Value::Str(s) = &val {
+                        date = s.clone();
+                    }
+                }
+                fields.push(val);
+            }
+            records.push(Record {
+                t: 0,
+                date,
+                fields,
+                layout: layout.clone(),
+            });
+        }
+        self.inner
+            .write(table, code, &records, None)
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("write failed: {e}")))
+    }
+
     /// 显式释放底层 mmap（Store drop 亦会释放；保留为对称 API）。
     fn close(&mut self) {
         // Store 无独立 close；drop 即释放。
+    }
+
+    // ---- 分时（MinuteStore，独立于列式引擎）----
+    /// 写入单只票单日分时块（trends2 形态：现价 + 均价 + 量）。
+    /// `bar`: dict，键含 code/date/minutes/opens/highs/lows/closes/volumes/amounts/avgs。
+    /// avgs 为分时均价序列（经典分时图第二条线）；缺失则空序列。
+    fn write_minute(&self, bar: &Bound<PyDict>) -> PyResult<()> {
+        let b = dict_to_minute_bar(bar)?;
+        MinuteStore::new(&self.root)
+            .write(&b)
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("write_minute failed: {e}")))
+    }
+
+    /// 读取单只票单日分时块；缺块返回 None。
+    fn read_minute(&self, code: &str, date: &str, py: Python<'_>) -> PyResult<Option<Py<PyDict>>> {
+        let bar = MinuteStore::new(&self.root)
+            .read(code, date)
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("read_minute failed: {e}")))?;
+        Ok(bar.map(|b| minute_bar_to_dict(py, &b)))
+    }
+
+    /// 某只票已有分时日期列表（升序）。
+    fn minute_dates(&self, code: &str) -> PyResult<Vec<String>> {
+        MinuteStore::new(&self.root)
+            .dates_of(code)
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("minute_dates failed: {e}")))
     }
 }
 
@@ -129,6 +213,97 @@ fn value_to_py(py: Python<'_>, v: &Value) -> PyObject {
         Value::Bool(b) => b.into_py(py),
         Value::Null => py.None(),
     }
+}
+
+/// 将 Python 对象按字段类型转为 `Value`：None/缺失 -> Null；数值列接受 int/float。
+fn pyobj_to_value(obj: &Bound<'_, pyo3::PyAny>, kind: FieldKind) -> PyResult<Value> {
+    if obj.is_none() {
+        return Ok(Value::Null);
+    }
+    match kind {
+        FieldKind::Bool => Ok(Value::Bool(obj.is_truthy()?)),
+        FieldKind::T => {
+            if let Ok(i) = obj.extract::<i64>() {
+                Ok(Value::I64(i))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        FieldKind::Str(_) => {
+            if let Ok(s) = obj.extract::<String>() {
+                Ok(Value::Str(s))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        FieldKind::F64 | FieldKind::Scaled(_) => {
+            if let Ok(f) = obj.extract::<f64>() {
+                Ok(Value::F64(f))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        FieldKind::Present => Ok(Value::Null),
+    }
+}
+
+/// 将 Python dict 转为 `MinuteBar`（字段缺失视为空序列）。
+fn dict_to_minute_bar(dict: &Bound<'_, PyDict>) -> PyResult<MinuteBar> {
+    fn get_vec(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Vec<f64>> {
+        match dict.get_item(key)? {
+            Some(v) => {
+                let list = v
+                    .downcast::<PyList>()
+                    .map_err(|_| PyTypeError::new_err(format!("{key} must be a list")))?;
+                let mut out = Vec::with_capacity(list.len());
+                for it in list.iter() {
+                    if it.is_none() {
+                        out.push(0.0);
+                    } else {
+                        out.push(it.extract::<f64>().unwrap_or(0.0));
+                    }
+                }
+                Ok(out)
+            }
+            None => Ok(Vec::new()),
+        }
+    }
+    let code = dict
+        .get_item("code")?
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_default();
+    let date = dict
+        .get_item("date")?
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_default();
+    Ok(MinuteBar {
+        code,
+        date,
+        minutes: get_vec(dict, "minutes")?,
+        opens: get_vec(dict, "opens")?,
+        highs: get_vec(dict, "highs")?,
+        lows: get_vec(dict, "lows")?,
+        closes: get_vec(dict, "closes")?,
+        volumes: get_vec(dict, "volumes")?,
+        amounts: get_vec(dict, "amounts")?,
+        avgs: get_vec(dict, "avgs")?,
+    })
+}
+
+/// 将 `MinuteBar` 转为 Python dict（与 `dict_to_minute_bar` 对称）。
+fn minute_bar_to_dict(py: Python<'_>, b: &MinuteBar) -> Py<PyDict> {
+    let d = PyDict::new_bound(py);
+    let _ = d.set_item("code", b.code.clone());
+    let _ = d.set_item("date", b.date.clone());
+    let _ = d.set_item("minutes", b.minutes.clone());
+    let _ = d.set_item("opens", b.opens.clone());
+    let _ = d.set_item("highs", b.highs.clone());
+    let _ = d.set_item("lows", b.lows.clone());
+    let _ = d.set_item("closes", b.closes.clone());
+    let _ = d.set_item("volumes", b.volumes.clone());
+    let _ = d.set_item("amounts", b.amounts.clone());
+    let _ = d.set_item("avgs", b.avgs.clone());
+    d.unbind()
 }
 
 // 注意：真正的模块入口 `#[pymodule] fn stockdb_rs` 放在 crate 根 (lib.rs)，不在此处。

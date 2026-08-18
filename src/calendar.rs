@@ -31,6 +31,14 @@ impl TradingCalendar {
         Ok(Self { dates, index })
     }
 
+    /// 空日历（用于首次打开尚不存在的数据根目录）。
+    pub fn empty() -> Self {
+        Self {
+            dates: Vec::new(),
+            index: HashMap::new(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.dates.len()
     }

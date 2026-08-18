@@ -27,6 +27,10 @@ pub struct MinuteBar {
     pub volumes: Vec<f64>,
     #[serde(default)]
     pub amounts: Vec<f64>,
+    /// 分时均价序列（经典分时图第二条线；trends2 parts[2]）。
+    /// 既有 `.min` 文件无此字段时 serde 默认空序列，向后兼容。
+    #[serde(default)]
+    pub avgs: Vec<f64>,
 }
 
 /// 分时块存储 (按 code + date 定位文件)。
@@ -103,6 +107,9 @@ mod tests {
             closes: minutes.iter().map(|m| 10.0 + m * 1.5).collect(),
             volumes: minutes.iter().map(|m| 1000.0 + m).collect(),
             amounts: minutes.iter().map(|m| 1e6 + m * 100.0).collect(),
+            // 用精确可表示的增量（避免 f64 在 JSON 往返时踩 Rust FromStr 的 1-ULP 边界），
+            // 仍验证 avgs 字段的序列化/反序列化。
+            avgs: minutes.iter().map(|m| (*m) + 100.0).collect(),
         }
     }
 

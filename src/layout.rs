@@ -393,7 +393,7 @@ pub fn decode_row(table: &str, buf: &[u8]) -> Option<Record> {
 }
 
 /// 字段类型 -> 编码字符（与 `encode_row` / `decode_row` 对称）。
-fn format_char(kind: &FieldKind) -> char {
+pub fn format_char(kind: &FieldKind) -> char {
     match kind {
         FieldKind::Bool => '?',
         FieldKind::Str(_) => 's',
