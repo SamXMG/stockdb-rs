@@ -17,11 +17,27 @@ serde_json = "1"
 chrono = "0.4"
 md-5 = "0.10"
 fs4 = "0.13"
+# 精确有理数：复权因子链用 BigRational 计算，"按构造精确"到分（避免 f64 累积漂移，
+# 且不受运算次序/并行影响，保证回测可重放确定性）。仅 view.rs 使用。
+num = "0.4"
+# abi3-py38: 以 CPython 受限 ABI 构建，产出的 .pyd 可在任意 CPython >= 3.8 上加载
+# (含当前 3.13.x 及未来 3.14+)，与构建期所用的解释器版本解耦，避免服务端 Python
+# 升级后需要重新编译。核心逻辑不依赖任何全量 CPython API，纯 abi3 安全。
+pyo3 = { version = "0.22", optional = true, features = ["abi3-py38"] }
 
 [dev-dependencies]
 
+[features]
+# 默认无 pyo3：核心库保持语言中立（仅靠 C ABI 跨语言），任何宿主都可用。
+# 开启 pyo3 仅额外产出一个 Python 原生扩展模块（与 C ABI 符号共存于同一 cdylib），
+# 供 Python 端 `import stockdb_rs` 直接调用，无需 ctypes、也无需 Python 参考实现读 .dat。
+default = []
+pyo3 = ["dep:pyo3"]
+
 # 同时产出 rlib（供 cargo test / examples 用）与 cdylib（供任意有 C FFI 的语言加载）。
 # cdylib 文件名 = 包名连字符转下划线 => stockdb_rs.dll (Windows) / libstockdb_rs.so (Linux)。
+# pyo3 feature 开启时，该 cdylib 额外导出 PyInit_stockdb_rs（供 Python import），
+# 原有 C ABI 符号（stockdb_open 等）保持不变，两者共存。
 [lib]
 name = "stockdb_rs"
 crate-type = ["lib", "cdylib"]

@@ -19,6 +19,26 @@ pub mod lock;
 pub mod minute;
 pub mod view;
 
+// pyo3 原生绑定（feature-gated）：仅 `cargo build --features pyo3` 时编译，
+// 提供 Python 原生 `import stockdb_rs`，与 ffi.rs 的 C ABI 符号共存于同一 cdylib。
+#[cfg(feature = "pyo3")]
+pub mod pyo3_api;
+
+// 模块入口必须位于 crate 根：cdylib 的导出表只可靠地收纳 crate 根层级的
+// `#[export_name]`/`#[no_mangle]` 符号；若 `#[pymodule]` 写在嵌套模块里，
+// `PyInit_stockdb_rs` 会被 rustc 当作无 Rust 调用方的死代码消除，导致
+// `import stockdb_rs` 报 "does not define module export function"。
+// `StockDB` 类本身定义在 `pyo3_api` 子模块（feature-gated，保持隔离）。
+#[cfg(feature = "pyo3")]
+use pyo3::types::PyModuleMethods;
+
+#[cfg(feature = "pyo3")]
+#[pyo3::pymodule]
+fn stockdb_rs(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
+    m.add_class::<pyo3_api::StockDB>()?;
+    Ok(())
+}
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};

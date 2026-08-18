@@ -189,10 +189,21 @@ func_call := name '(' arg (',' arg)* ')'                 // 见 §2.2 / 标量�
 - **所有权**：返回的 `out_len` / `out_cap` 必须原样回传 `stockdb_free_buf(ptr, len, cap)`
   释放，否则泄漏（纪律同 §1.3）。
 
-**调用端适配（示例，Python 参考实现见 `python/stockdb_rs.py::decode_rows`）**：
+**调用端适配（示例，Python ctypes 消费者见 `python/stockdb_rs_ctypes.py::decode_rows`）**：
 
 ```python
 import struct
+
+# 缩放列：磁盘 i32（×scale 写入），读时 ÷scale 还原；哨兵 i32::MIN -> None。
+# 与 §3 / Rust `layout::SCALED` 完全一致。SCALE 取值见下方。
+SCALE = {"open":100.0, "high":100.0, "low":100.0, "close":100.0,
+         "prev_close":100.0, "price":100.0,            # 价格类 2 位小数 -> ×100
+         "turnover":10000.0, "chg_pct":10000.0, "vol_ratio":10000.0,
+         "chg60":10000.0, "pe":10000.0, "pb":10000.0,  # 百分比/比率类 4 位小数 -> ×10000
+         "main_pct":10000.0, "xl_pct":10000.0, "l_pct":10000.0,
+         "mid_pct":10000.0, "small_pct":10000.0}
+SCALED_NULL = -(2**31)  # i32::MIN
+
 buf, n_hits, rlen, shash = db.query_bin("RawDailyBar", "close>10")
 assert shash == db.schema_hash("RawDailyBar")          # schema 版本护栏
 assert buf[0:4] == (0x53544231).to_bytes(4, "little")  # magic
@@ -201,9 +212,17 @@ for _ in range(n_hits):
     present = buf[off]; off += 1
     if not present:
         off += rlen - 1; continue
-    code = buf[off:off+16].split(b"\x00")[0].decode(); off += 16   # 首字段 code
-    t    = struct.unpack_from("<q", buf, off+16)[0]                # 第二字段 t
-    # ... 其余字段按 §3.1 / §3.2 顺序与宽度逐字段解码 ...
+    code = buf[off:off+16].split(b"\x00")[0].decode(); off += 16   # 首字段 code (s,16)
+    t    = struct.unpack_from("<q", buf, off)[0];      off += 8    # 第二字段 t (q,8)
+    date = buf[off:off+10].split(b"\x00")[0].decode(); off += 10  # date (s,10)
+    # 价格列是缩放整数 I(4B)：i32 读回 ÷scale 还原；哨兵 i32::MIN -> None
+    o = struct.unpack_from("<i", buf, off)[0]; off += 4
+    o = None if o == SCALED_NULL else o / SCALE["open"]
+    # high/low/close 同理（各 I,4B，顺序见 §3.1）
+    # volume/amount 是普通 f64 (d,8B)：NaN -> None
+    v = struct.unpack_from("<d", buf, off)[0]; off += 8
+    v = None if v != v else v
+    # ... 其余字段按 §3.1 顺序与 §3.2/§3.3 宽度逐字段解码 ...
 ```
 
 > 二进制路径把"如何把字节变成对象"的责任完全交给调用端——正是"调用端自己写适配接口"

@@ -2,9 +2,13 @@
 
 把 Rust 编出的 cdylib (stockdb_rs.dll / libstockdb_rs.so) 暴露成 Python 类。
 同一套 C ABI 符号也可被 C/C++/Go/Java/Ruby/Node 等直接调用。
+
+> 这是「两种 Python 集成方式」之一：ctypes 消费 C ABI（本文件）。
+> 另一种是直接 `import stockdb_rs`（pyo3 原生绑定，由 `cargo build --features pyo3`
+> 产出，与 C ABI 符号共存于同一 cdylib）；原生绑定无需自行解码字节，优先推荐。
 用法::
 
-    from stockdb_rs import StockDB
+    from stockdb_rs_ctypes import StockDB
     db = StockDB("/path/to/store")          # 指向含 calendar.json 的根目录
     closes = db.read_column("RawDailyBar", "600000", "close")
     c1 = db.read_at("RawDailyBar", "600000", t=1, field="close")
@@ -291,8 +295,9 @@ class StockDB:
         return rows
 
     def close(self):
-        if self._h:
-            self._load().stockdb_free(self._h)
+        h = getattr(self, "_h", None)
+        if h:
+            self._load().stockdb_free(h)
             self._h = None
 
     def __del__(self):

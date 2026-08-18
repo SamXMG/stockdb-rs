@@ -18,13 +18,13 @@ fn main() -> std::io::Result<()> {
         ("code".into(), 's'),
         ("t".into(), 'q'),
         ("date".into(), 's'),
-        ("open".into(), 'd'),
-        ("high".into(), 'd'),
-        ("low".into(), 'd'),
-        ("close".into(), 'd'),
+        ("open".into(), 'I'),
+        ("high".into(), 'I'),
+        ("low".into(), 'I'),
+        ("close".into(), 'I'),
         ("volume".into(), 'd'),
         ("amount".into(), 'd'),
-        ("turnover".into(), 'd'),
+        ("turnover".into(), 'I'),
     ];
     let dates = ["2024-01-02", "2024-01-03", "2024-01-04"];
     let closes = [10.2_f64, 10.8, 11.5]; // 这些值专门用于 cdylib 侧回读校验
