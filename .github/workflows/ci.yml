@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    name: cargo test --lib (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # 自包含回归：`--lib` 不依赖 python / 外部 Screener fixture，干净环境即可跑。
+      # 集成测试（tests/align_with_python.rs 等）需要本机 python3 + 本地行情夹具，
+      # 不在 CI 默认矩阵内运行，需本地单独 `cargo test --test align_with_python`。
+      - name: Build examples
+        run: cargo build --examples --verbose
+
+      - name: Run lib unit tests
+        run: cargo test --lib --verbose
+
+  backtest-rs:
+    name: backtest-rs build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Python (for pyo3 extension-module)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build backtest-rs
+        run: cargo build --manifest-path backtest-rs/Cargo.toml --verbose

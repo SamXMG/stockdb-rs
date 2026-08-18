@@ -2,7 +2,7 @@
 name = "stockdb-rs"
 version = "0.1.0"
 edition = "2021"
-description = "A股列式存储数据库: 定长二进制 + 全局交易日历 t 对齐 + mmap 零拷贝随机读 (与 Python stockdb 二进制兼容)"
+description = "A股列式存储数据库(语言中立): 定长二进制 + 全局交易日历 t 对齐 + mmap 零拷贝随机读 (二进制格式参考实现为 Python stockdb)"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/your-org/stockdb-rs"
@@ -16,5 +16,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
 md-5 = "0.10"
+fs4 = "0.13"
 
 [dev-dependencies]
+
+# 同时产出 rlib（供 cargo test / examples 用）与 cdylib（供任意有 C FFI 的语言加载）。
+# cdylib 文件名 = 包名连字符转下划线 => stockdb_rs.dll (Windows) / libstockdb_rs.so (Linux)。
+[lib]
+name = "stockdb_rs"
+crate-type = ["lib", "cdylib"]

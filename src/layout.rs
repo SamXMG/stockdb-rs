@@ -1,5 +1,4 @@
-//! 二进制编码契约 —— 与 Python `stockdb/engine.py` 的 `_TABLE_FIELDS` /
-//! `_BOOL_FIELDS` / `_STR_W` / `_build_layout` 严格 1:1 对应。
+//! 二进制编码契约 —— 语言中立格式。
 //!
 //! 每条记录布局（小端 `<`）：
 //!   首字节 `<?` 为 present 标记（1=有数据, 0=空槽）；其后按字段序列排布。
@@ -8,7 +7,7 @@
 //!   - `t` 字段：`q` (i64，全局交易日索引)
 //!   - 其余数值：`d` (f64，空值用 NaN 占位)
 
-/// 各字符串字段宽度（字节），与 Python `_STR_W` 一致。
+/// 各字符串字段宽度（字节），定宽 utf-8 截断补齐。
 pub const STR_W: &[(&str, usize)] = &[
     ("code", 16), ("index_code", 16), ("date", 10), ("ex_date", 10),
     ("list_date", 10), ("delist_date", 10), ("ann_date", 10),
@@ -19,7 +18,7 @@ pub const STR_W: &[(&str, usize)] = &[
     ("url", 64), ("reason", 64), ("note", 64), ("concepts", 192),
 ];
 
-/// 各表的 bool 字段集合，与 Python `_BOOL_FIELDS` 一致。
+/// 各表的 bool 字段集合。
 pub const BOOL_FIELDS: &[(&str, &[&str])] = &[
     ("RawDailyBar", &[]),
     ("FundFlow", &[]),
@@ -33,7 +32,7 @@ pub const BOOL_FIELDS: &[(&str, &[&str])] = &[
     ("RenameEvent", &[]),
 ];
 
-/// 各表字段序列（顺序即落盘顺序），与 Python `_TABLE_FIELDS` 一致。
+/// 各表字段序列（顺序即落盘顺序）。
 pub const TABLE_FIELDS: &[(&str, &[&str])] = &[
     ("RawDailyBar", &[
         "code", "t", "date", "open", "high", "low", "close",
@@ -79,6 +78,7 @@ pub const TABLE_FIELDS: &[(&str, &[&str])] = &[
 ];
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 字段类型分类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +91,7 @@ pub enum FieldKind {
 }
 
 /// 计算某表的单条记录字节长度（含首字节 present）。
-/// 与 Python `struct.calcsize("<?" + ...)` 等价。
+/// 等于 1（present）+ 各字段字节之和，与定长结构计算等价。
 pub fn record_len(table: &str) -> Option<usize> {
     let fields = TABLE_FIELDS.iter().find(|(t, _)| *t == table)?.1;
     let bools: Vec<&str> = BOOL_FIELDS
@@ -148,10 +148,79 @@ pub enum Value {
     Null, // present=0 或 NaN
 }
 
-/// 一行解码结果（列式，与 schema 声明顺序一致），可直接对称编码回字节。
+/// 全表共享的 schema：字段类型序列 + 编码布局 + 字段名下标 + 列字节偏移。
+/// 同一张表的 schema 是常量，所有行共享同一份 `Arc`：
+/// - 解码时不再每行重建 `field_kinds` / 克隆字段名；
+/// - 字节级查询内核直接复用 `index` / `offsets`，避免每次查询重建 HashMap 与累加偏移。
+pub struct Schema {
+    pub kinds: Vec<(String, FieldKind)>,
+    pub layout: Arc<[(String, char)]>,
+    /// 字段名 -> 在 `Record.fields` / `field_kinds` 中的下标（供 `bind` 直接复用）。
+    pub index: HashMap<String, usize>,
+    /// 每个字段在定长 stride 内的字节偏移（present 之后）与类型，
+    /// 供字节级 eval 直接按列偏移取 `f64`/`i64`/`bool`/`str`。
+    pub offsets: Vec<(usize, FieldKind)>,
+}
+
+/// 全局 schema 缓存：首次按表构建，之后所有 `decode_row` / `record_layout` 共享。
+/// 这消除了原先「每行都重建 `field_kinds` 向量 + 克隆字段名」的千万级堆分配。
+static SCHEMAS: OnceLock<Mutex<HashMap<String, Arc<Schema>>>> = OnceLock::new();
+
+fn schema_arc(table: &str) -> Option<Arc<Schema>> {
+    let map = SCHEMAS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(g) = map.lock() {
+        if let Some(s) = g.get(table) {
+            return Some(s.clone());
+        }
+    }
+    let kinds = field_kinds(table)?;
+    // 字段名 -> 下标（供 `bind` 直接复用，避免每次查询重建 HashMap）。
+    let index: HashMap<String, usize> = kinds
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| (n.clone(), i))
+        .collect();
+    // 字段在 stride 内的字节偏移（present 之后），供字节级 eval 按列偏移直接取列值。
+    let mut off = 1usize; // present 标记占 1 字节
+    let mut offsets: Vec<(usize, FieldKind)> = Vec::with_capacity(kinds.len());
+    for (_, kind) in &kinds {
+        offsets.push((off, *kind));
+        off += match kind {
+            FieldKind::Bool => 1,
+            FieldKind::Str(w) => *w,
+            FieldKind::T | FieldKind::F64 => 8,
+            FieldKind::Present => 1,
+        };
+    }
+    let layout: Arc<[(String, char)]> = Arc::from(
+        kinds
+            .iter()
+            .map(|(n, k)| (n.clone(), format_char(k)))
+            .collect::<Vec<_>>(),
+    );
+    let s = Arc::new(Schema {
+        kinds,
+        layout,
+        index,
+        offsets,
+    });
+    if let Ok(mut g) = map.lock() {
+        g.insert(table.to_string(), s.clone());
+    }
+    Some(s)
+}
+
+/// 返回全表共享 schema（`index` / `offsets` 已预计算），供字节级查询内核直接复用，
+/// 避免每次查询重建字段名下标与累加列偏移。
+pub fn schema_ref(table: &str) -> Option<Arc<Schema>> {
+    schema_arc(table)
+}
+
+/// 一行解码结果（行式定长记录，与 schema 声明顺序一致），可直接对称编码回字节。
 ///
-/// 为极致性能，`fields` 采用**列式定长 `Vec<Value>`**：第 `i` 个槽位对应
-/// `field_kinds(table)[i]` 的字段，下标定位 O(1)，无字符串 key 散列与堆分配。
+/// `fields` 为行内定长 `Vec<Value>`：第 `i` 个槽位对应 `field_kinds(table)[i]` 的字段，
+/// 下标定位 O(1)。`layout`（字段名+格式字符）为全表共享的 `Arc`，解码时只克隆指针、
+/// 不复制字段名字符串。
 /// 字段名索引由 `field_index(table)` 提供。
 #[derive(Debug, Clone, Default)]
 pub struct Record {
@@ -159,8 +228,8 @@ pub struct Record {
     /// 字段值，按 schema 顺序排列（与 `field_kinds` 下标一致）。
     pub fields: Vec<Value>,
     /// 编码所需的字段布局：(字段名, format_char) 序列。
-    /// 仅在 `decode_row` 解码出的 Record 上填充，用于对称 `encode_row`。
-    pub layout: Vec<(String, char)>,
+    /// 解码行共享全表 `Arc`（仅原子计数，无字符串堆分配）；写入方自建 Record 也复用同一份。
+    pub layout: Arc<[(String, char)]>,
 }
 
 /// 字段名 -> 在 `Record.fields` / `field_kinds` 中的下标。
@@ -174,10 +243,43 @@ pub fn field_index(table: &str) -> Option<HashMap<String, usize>> {
     Some(m)
 }
 
+/// 全表共享的编码布局 `(字段名, format_char)` 序列（首次构建后缓存）。
+/// 供写入方（ingest_bridge / backtest 造数）一次性获取，避免逐行重建。
+pub fn record_layout(table: &str) -> Option<Arc<[(String, char)]>> {
+    schema_arc(table).map(|s| s.layout.clone())
+}
+
+/// 字段布局的确定性指纹（FNV-1a 64），跨平台 / 运行稳定。
+///
+/// 用于二进制查询结果（`query_bin`）的 schema 版本护栏：调用端可比对
+/// 缓冲 header 的 `schema_hash` 与本地 `schema_hash(table)`，确认双方
+/// 看到的是同一套字段类型布局（顺序 / 类型 / 宽度一致），避免字节漂移读错。
+/// 未知表返回 0。
+pub fn schema_hash(table: &str) -> u64 {
+    let kinds = match field_kinds(table) {
+        Some(k) => k,
+        None => return 0,
+    };
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325; // FNV offset basis
+    for (name, kind) in &kinds {
+        for &b in name.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3); // FNV prime
+        }
+        h ^= b'=' as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        let kc = format_char(kind) as u8;
+        h ^= kc as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// 解码单行（含 present 判断），返回保序 `Record`。
 /// `buf` 长度须等于 `record_len(table)`。返回 `None` 表示该槽为空（present=0）。
 pub fn decode_row(table: &str, buf: &[u8]) -> Option<Record> {
-    let kinds = field_kinds(table)?;
+    // 复用全表共享 schema：不再每行重建 `field_kinds` / 克隆字段名（共享缓存，零每行堆分配）。
+    let schema = schema_arc(table)?;
     let rlen = record_len(table)?;
     if buf.len() < rlen {
         return None;
@@ -187,8 +289,8 @@ pub fn decode_row(table: &str, buf: &[u8]) -> Option<Record> {
     }
     let mut off = 1usize;
     let mut rec = Record::default();
-    rec.fields.reserve(kinds.len());
-    for (name, kind) in kinds {
+    rec.fields.reserve(schema.kinds.len());
+    for (name, kind) in &schema.kinds {
         let v = match kind {
             FieldKind::Bool => {
                 let b = buf[off];
@@ -197,9 +299,9 @@ pub fn decode_row(table: &str, buf: &[u8]) -> Option<Record> {
             }
             FieldKind::Str(w) => {
                 // 零拷贝友好：先按 \0 截断再 trim，避免扫描整段后多余分配。
-                let raw = &buf[off..off + w];
-                off += w;
-                let end = raw.iter().position(|&c| c == 0).unwrap_or(w);
+                let raw = &buf[off..off + *w];
+                off += *w;
+                let end = raw.iter().position(|&c| c == 0).unwrap_or(*w);
                 let s = std::str::from_utf8(&raw[..end])
                     .map(|s| s.trim().to_string())
                     .unwrap_or_default();
@@ -229,13 +331,14 @@ pub fn decode_row(table: &str, buf: &[u8]) -> Option<Record> {
                 rec.t = *t;
             }
         }
-        rec.layout.push((name.clone(), format_char(&kind)));
         rec.fields.push(v);
     }
+    // 共享全表 layout：仅 Arc 指针克隆（原子计数），零字符串堆分配。
+    rec.layout = schema.layout.clone();
     Some(rec)
 }
 
-/// 字段类型 -> struct format char（与 Python `_build_layout` 一致）。
+/// 字段类型 -> 编码字符（与 `encode_row` / `decode_row` 对称）。
 fn format_char(kind: &FieldKind) -> char {
     match kind {
         FieldKind::Bool => '?',
@@ -336,8 +439,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_lens_match_python() {
-        // Python struct.calcsize 实测值(见 engine.py 输出/RawDailyBar 72891/801)
+    fn record_lens_canonical() {
+        // 实测字节长度：801 行 × rlen == 72891 ⇒ rlen == 91
         // 801 * rlen == 72891 => rlen == 91
         assert_eq!(record_len("RawDailyBar"), Some(91));
         // CompanyProfile: 303579 / 801 = 379

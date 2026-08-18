@@ -1,10 +1,10 @@
-//! 落库桥: 接收 Python `stockdb` 采集+适配产出的模型 JSON, 用 Rust `stockdb_rs`
-//! 引擎写入列式 `.dat` (与 Python `engine.ingest_stock` 字节兼容).
+//! 落库桥：从 stdin 逐行读取模型 JSON（由采集 / 适配层产出），用 Rust 引擎写入
+//! 列式 `.dat`。模型 JSON 格式为语言中立契约，任何采集端均可产出。
 //!
-//! 用法 (由 Python `stockdb/ingest_rust.py` 调用):
-//!   python3 -m stockdb.collect_one 600000 | stockdb_rs ingest_bridge <root>
+//! 用法（由采集端调用）：
+//!   <采集进程> | stockdb_rs ingest_bridge <root>
 //!
-//! stdin 逐行 JSON, 每行描述一只票的全部表:
+//! stdin 逐行 JSON，每行描述一只票的全部表：
 //! {
 //!   "code": "600000",
 //!   "tables": {
@@ -15,7 +15,7 @@
 //!   "minute": [ {"date":"2023-01-03","minutes":[...], ...}, ... ]   // 可选
 //! }
 //!
-//! 每只票的每个表一次性 write (覆盖写, 与 Python 侧一致).
+//! 每只票的每个表一次性 write（覆盖写，与列式落盘布局一致）。
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
@@ -77,7 +77,7 @@ fn json_to_value(kind: layout::FieldKind, j: &J) -> Value {
 }
 
 fn build_record(table: &str, row: &RowModel) -> Option<Record> {
-    let kinds = layout::field_kinds(table)?;
+    let layout = layout::record_layout(table)?;
     let date = row
         .fields
         .get("date")
@@ -87,12 +87,11 @@ fn build_record(table: &str, row: &RowModel) -> Option<Record> {
     if date.is_empty() {
         return None; // 无日期的行无效
     }
+    let kinds = layout::field_kinds(table)?;
     let mut fields: Vec<Value> = Vec::with_capacity(kinds.len());
-    let mut layout: Vec<(String, char)> = Vec::with_capacity(kinds.len());
     for (name, kind) in &kinds {
         let j = row.fields.get(name).cloned().unwrap_or(J::Null);
         fields.push(json_to_value(*kind, &j));
-        layout.push((name.clone(), format_char(kind)));
     }
     Some(Record {
         t: 0, // 由 Store::write 内部 ensure(date) 定稿
@@ -100,16 +99,6 @@ fn build_record(table: &str, row: &RowModel) -> Option<Record> {
         fields,
         layout,
     })
-}
-
-fn format_char(kind: &layout::FieldKind) -> char {
-    match kind {
-        layout::FieldKind::Bool => '?',
-        layout::FieldKind::Str(_) => 's',
-        layout::FieldKind::T => 'q',
-        layout::FieldKind::F64 => 'd',
-        layout::FieldKind::Present => 'x',
-    }
 }
 
 fn ingest_one(store: &Store, min_store: &MinuteStore, model: &StockModel) -> io::Result<usize> {

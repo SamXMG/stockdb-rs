@@ -1,14 +1,13 @@
-//! 分时存储 (`MinuteBar`)。
+//! 分时存储（`MinuteBar`）。
 //!
-//! 与 Python `stockdb.engine.MinuteStore` 二进制/文本格式兼容:
-//! 每个 (code, date) 一块, 存为 `root/minute/{code}/{date}.min` 的 JSON
-//! (字段名与 `schema.MinuteBar` dataclass 一致)。不走列式定长体系。
+//! 语言中立 JSON 块格式：每个 (code, date) 一块，存为 `root/minute/{code}/{date}.min`，
+//! 字段名与序列化顺序见 `MinuteBar`。不走列式定长体系。
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// 单只票单日分时序列 (与 Python `schema.MinuteBar` 字段一一对应)。
+/// 单只票单日分时序列（字段顺序即 JSON 序列化顺序）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MinuteBar {
     pub code: String,
@@ -47,7 +46,7 @@ impl MinuteStore {
         dir.join(format!("{date}.min"))
     }
 
-    /// 写入单日分时块 (覆盖)。与 `MinuteStore.write` 兼容。
+    /// 写入单日分时块（覆盖写，与 `read` 对称）。
     pub fn write(&self, bar: &MinuteBar) -> std::io::Result<()> {
         let p = self.path(&bar.code, &bar.date);
         if let Some(parent) = p.parent() {
@@ -58,7 +57,7 @@ impl MinuteStore {
         Ok(())
     }
 
-    /// 读取单日分时块。与 `MinuteStore.read` 兼容; 缺块返回 None。
+    /// 读取单日分时块（与 `write` 对称）；缺块返回 None。
     pub fn read(&self, code: &str, date: &str) -> std::io::Result<Option<MinuteBar>> {
         let p = self.path(code, date);
         if !p.exists() {

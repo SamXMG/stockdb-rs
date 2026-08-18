@@ -8,3 +8,6 @@ Cargo.lock
 *.dat
 *.meta
 *.json
+
+# 本地 example 运行产物(make_fixture 生成, 含二进制 .dat / .lock)
+/fixture/

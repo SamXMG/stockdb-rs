@@ -1,5 +1,5 @@
-//! 交易日历 —— 与 Python `stockdb/calendar.py` 的 JSON 数组格式兼容。
-//! `calendar.json` 是紧凑 JSON 字符串数组: ["2023-07-14","2023-07-17",...]
+//! 交易日历 —— 语言中立 JSON 字符串数组格式。
+//! `calendar.json` 为紧凑 JSON 数组: ["2023-07-14","2023-07-17",...]
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -40,8 +40,8 @@ impl TradingCalendar {
     }
 
     /// append-only 扩展: 若 `d` 不在日历, 按升序插入到正确位置并返回新 t; 否则返回已有 t。
-    /// ISO 日期串可直接字典序比较, 保证日历始终严格升序 (避免乱序膨胀)。
-    /// 与 Python `Calendar.ensure` 语义一致 (全局交易日索引唯一且稳定)。
+    /// ISO 日期串可直接字典序比较，保证日历始终严格升序（避免乱序膨胀）。
+    /// 全局交易日索引唯一且稳定，append-only 扩展。
     pub fn ensure(&mut self, d: &str) -> usize {
         if let Some(&t) = self.index.get(d) {
             return t;
@@ -55,6 +55,26 @@ impl TradingCalendar {
             self.index.insert(x.clone(), i);
         }
         pos
+    }
+
+    /// 把另一个日历的日期并入自身（去重 + 保持升序 + 重建索引）。
+    ///
+    /// 用于跨进程写日历时，把磁盘上已被其他进程 `ensure` 过的日期补回内存，
+    /// 避免 `save_calendar` 互相覆盖导致丢失交易日。O((n+m)·log(n+m))。
+    pub fn merge(&mut self, other: &TradingCalendar) {
+        if other.dates.is_empty() {
+            return;
+        }
+        let mut all: Vec<String> = self.dates.clone();
+        all.extend(other.dates.iter().cloned());
+        all.sort();
+        all.dedup();
+        let mut index = HashMap::with_capacity(all.len());
+        for (i, d) in all.iter().enumerate() {
+            index.insert(d.clone(), i);
+        }
+        self.dates = all;
+        self.index = index;
     }
 
     /// 序列化回 `calendar.json` 格式 (紧凑字符串数组)。
@@ -78,8 +98,7 @@ impl TradingCalendar {
         self.index.get(d).map(|t| *t as i64).unwrap_or(default)
     }
 
-    /// 日历指纹 (与 Python `Calendar.hash` 一致)。
-    /// `md5(f"{first}|{last}|{len}")[:12]`，截断为 12 位十六进制串。
+    /// 日历指纹：md5(first|last|len) 截断为 12 位十六进制串。
     pub fn hash(&self) -> String {
         use md5::{Digest, Md5};
         let first = self.dates.first().map(|s| s.as_str()).unwrap_or("");

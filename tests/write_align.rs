@@ -21,6 +21,9 @@ fn testdata_dir() -> PathBuf {
     p
 }
 
+/// 相对 crate 的同级 Screener 目录 (由 CARGO_MANIFEST_DIR 推导, 跨平台, 不依赖 cwd)。
+const SCREENER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../Screener");
+
 fn approx(a: f64, b: f64) -> bool {
     if a.is_nan() && b.is_nan() {
         return true;
@@ -52,7 +55,7 @@ print(json.dumps(out, ensure_ascii=False))
     let out = Command::new("python3")
         .arg("-c")
         .arg(script)
-        .arg("/home/honor/Git/LIANGHUA/Screener")
+        .arg(SCREENER)
         .arg(root.to_str().unwrap())
         .arg(table)
         .arg(code)
@@ -173,8 +176,8 @@ fn meta_matches_python() {
     // 用 Python 对比 meta
     let script = r#"
 import sys, os, json, hashlib
-root, table, code = sys.argv[1], sys.argv[2], sys.argv[3]
-sys.path.insert(0, "/home/honor/Git/LIANGHUA/Screener")
+screener, root, table, code = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+sys.path.insert(0, screener)
 from stockdb.calendar import TradingCalendar
 cal = TradingCalendar.load(os.path.join(root, "calendar.json"))
 expected = {"cal_len": len(cal._dates), "cal_hash": cal.hash(), "table": table}
@@ -183,6 +186,7 @@ print(json.dumps(expected))
     let out = Command::new("python3")
         .arg("-c")
         .arg(script)
+        .arg(SCREENER)
         .arg(tmp.to_str().unwrap())
         .arg(table)
         .arg(code)

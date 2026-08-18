@@ -1,17 +1,21 @@
-//! stockdb-rs —— A股列式存储数据库的 Rust 实现。
+//! stockdb-rs —— A 股列式存储引擎（Rust 实现，语言中立）。
 //!
-//! 与 Python `stockdb/engine.py` 二进制布局严格兼容: 定长 `.dat`
-//! (cal.n × rbytes) + 首字节 present 标记 + 全局交易日历 `t` 对齐。
-//! 支持只读 (mmap/读) 与写入 (write/repack/.meta)。
+//! 二进制布局为语言中立契约，与参考实现保持字节级 1:1 兼容：
+//! 定长 `.dat`（`cal_len × rlen`）+ 首字节 present 标记 + 全局交易日历 `t` 对齐。
+//! 支持只读（mmap / 随机读）与写入（write / repack / .meta）。
 //!
-//! 极致性能要点:
+//! 性能要点：
 //! - `Store` 内部缓存 `Mmap`，`read_at` 仅解码目标行字节，不读全文件。
-//! - `Record.fields` 为列式 `Vec<Value>`，下标定位 O(1)，无 HashMap 分配。
-//! - `read_mmap` 直接基于 mmap 切片解码，避免整文件堆拷贝。
+//! - `Record.fields` 为行式定长 `Vec<Value>`，下标定位 O(1)，无 HashMap 分配。
+//! - `read_mmap` 基于 mmap 切片解码，避免整文件堆拷贝。
+//! - 查询（`expr`）直接在 mmap 字节上逐行求值，未命中行零解码、零分配
+//!   （见 `expr::scan_eval`）；命中行的 JSON 物化 / 二进制 memcpy 由调用方按需选择。
 
 pub mod calendar;
+pub mod expr;
 pub mod ffi;
 pub mod layout;
+pub mod lock;
 pub mod minute;
 pub mod view;
 
@@ -21,8 +25,12 @@ use std::sync::{Arc, RwLock};
 
 use memmap2::Mmap;
 
+use crate::lock::{atomic_write, with_exclusive_lock};
+
 pub use calendar::TradingCalendar;
-pub use layout::{decode_row, encode_row, record_len, field_index, field_kinds, FieldKind, Value};
+pub use layout::{
+    decode_row, encode_row, record_len, field_index, field_kinds, record_layout, FieldKind, Value,
+};
 
 /// 是否为"按全局交易日历对齐"的时序表。
 /// 时序表按 `cal.len()` 展开 (缺槽 present=0)，非时序/事件表按记录数展开，
@@ -34,7 +42,7 @@ pub fn is_calendar_table(table: &str) -> bool {
     )
 }
 
-/// 一条记录: 全局交易日索引 t + 列式字段(按 schema 顺序) + 编码布局。
+/// 一条记录: 全局交易日索引 t + 行式定长字段(按 schema 顺序) + 编码布局。
 #[derive(Debug, Clone)]
 pub struct Record {
     /// 交易日索引 (由 `write` 内部按 `date` 经日历 ensure 得到, 落盘时定稿)。
@@ -43,8 +51,8 @@ pub struct Record {
     pub date: String,
     /// 字段值，按 schema 顺序（与 `field_kinds` 下标一致）。
     pub fields: Vec<Value>,
-    /// 编码布局(保序), 供 `write`/`repack` 对称回字节。
-    pub layout: Vec<(String, char)>,
+    /// 编码布局(保序), 全表共享的 `Arc`，解码时仅克隆指针。供 `write`/`repack` 对称回字节。
+    pub layout: std::sync::Arc<[(String, char)]>,
 }
 
 impl Record {
@@ -93,11 +101,26 @@ impl Store {
     }
 
     /// 把当前(可能已扩展的)日历写回 `calendar.json`。
-    /// `write` 扩展日历后自动调用, 保证跨进程/跨票一致。
+    /// 在日历 sidecar 锁保护下做原子写，保证跨进程/跨票一致、且崩溃不留半截文件。
     pub fn save_calendar(&self) -> std::io::Result<()> {
-        let cal = self.cal.read().unwrap();
-        std::fs::write(&self.cal_path, cal.to_json())?;
-        Ok(())
+        with_exclusive_lock(&self.cal_path, || self.save_calendar_inner())
+    }
+
+    /// 回写日历的实际逻辑（假设调用方已持有日历锁）。
+    ///
+    /// 先合并磁盘上其他进程已 `ensure` 过的日期（防互相覆盖丢失），再原子写。
+    fn save_calendar_inner(&self) -> std::io::Result<()> {
+        if self.cal_path.exists() {
+            if let Ok(on_disk) = TradingCalendar::load(&self.cal_path) {
+                let mut cal = self.cal.write().unwrap();
+                cal.merge(&on_disk);
+            }
+        }
+        let json = {
+            let cal = self.cal.read().unwrap();
+            cal.to_json()
+        };
+        atomic_write(&self.cal_path, json.as_bytes())
     }
 
     /// 判断某表某票的数据文件是否存在。
@@ -208,6 +231,24 @@ impl Store {
         Ok(out)
     }
 
+    /// 声明式查询：在 `table` 上执行 DSL 表达式，返回所有命中行的 JSON 数组字符串。
+    ///
+    /// 表达式语法见 `expr` 模块。引擎在列式数据内逐行求值，零拷贝、
+    /// 不回传原始数据，仅回传命中行（`code`/`t`/ 全部字段）。DSL 字符串是语言中立
+    /// 契约：任何宿主语言只需构造该字符串、解析返回的 JSON 即可，无需回调宿主。
+    /// 例：`store.query("RawDailyBar", "close>10 && ma(close,20)>close")`
+    /// 跨语言入口见 `ffi::stockdb_query`（C ABI，同构）。
+    pub fn query(&self, table: &str, expr: &str) -> Result<String, String> {
+        crate::expr::query(self, table, expr)
+    }
+
+    /// 跨语言入口见 `ffi::stockdb_query_bin`（C ABI，同构，零 JSON）。
+    /// 返回 `[magic][record_len][n_hits][schema_hash][raw rows]` 二进制缓冲，
+    /// 调用端按 CONTRACT §4 自行解码，适合宽查询 / 性能关键路径。
+    pub fn query_bin(&self, table: &str, expr: &str) -> Result<Vec<u8>, String> {
+        crate::expr::query_bin(self, table, expr)
+    }
+
     /// 校验数据完整性（回测前调用，防静默错读）：
     /// - `.dat` 长度须为 `rlen` 整数倍（否则截断/损坏）
     /// - 若 `.meta` 存在，其 `cal_hash` 须与当前日历一致
@@ -249,6 +290,12 @@ impl Store {
     /// 将一组记录写入定长 .dat (覆盖写, present 自动标记)。
     /// 每条记录按其 `t` 放入 `t * rlen` 槽位; 缺槽填 present=0 空字节。
     /// `target_n` 不传时取 `max(t)+1` 与记录数较大者。
+    ///
+    /// 并发安全：整段在「日历排他锁」内完成（合并磁盘日历 → ensure 算 t → 写 .dat →
+    /// 回写日历）。`.dat` 的读写改写另在自身 sidecar 锁内做原子写。两锁配合：
+    /// - 杜绝两个 writer 交错覆盖导致的数据损坏/丢失；
+    /// - 日历锁贯穿 ensure→持久化，保证并发 ingest 时 `t` 全局索引稳定、且不同进程
+    ///   不会因各自回写 `calendar.json` 而互相丢失交易日。
     pub fn write(
         &self,
         table: &str,
@@ -259,95 +306,122 @@ impl Store {
         let rlen = record_len(table).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "unknown table")
         })?;
-        // 1) append-only 扩展日历: 所有行的 date 纳入, 返回其全局 t
-        let mut cal = self.cal.write().unwrap();
-        let mut recs: Vec<Record> = records
-            .iter()
-            .map(|r| {
-                let t = cal.ensure(&r.date) as i64;
-                Record {
-                    t,
-                    date: r.date.clone(),
-                    fields: r.fields.clone(),
-                    layout: r.layout.clone(),
-                }
-            })
-            .collect();
-        recs.sort_by_key(|r| r.t);
-        let cal_len = cal.len();
-        drop(cal);
-        // 2) 目标长度:
-        //    - 时序表(按全局交易日历对齐): 显式指定 > 日历长度 > max(t)+1
-        //    - 非时序/事件表(CompanyProfile/Announcement/AdjustEvent/RenameEvent):
-        //      仅按实际记录展开 (max_t+1)，不撑满日历，避免 cal.len() 条空壳爆炸
-        let max_t = recs.iter().map(|r| r.t).max().unwrap_or(0);
-        let n = if is_calendar_table(table) {
-            target_n
-                .unwrap_or_else(|| (max_t as usize + 1).max(cal_len))
-        } else {
-            target_n.unwrap_or_else(|| max_t as usize + 1)
-        };
         let path = self.root.join(table).join(format!("{code}.dat"));
-        // 3) 旧文件重排: 加载已有 present 记录, 按绝对 t 回填到新长度
-        let mut buf = vec![0u8; n * rlen];
-        if path.exists() {
-            let old = std::fs::read(&path)?;
-            let old_n = old.len() / rlen;
-            for t in 0..old_n {
-                let off = t * rlen;
-                if old[off] != 1 {
-                    continue;
-                }
-                if (t as usize) < n {
-                    buf[t as usize * rlen..(t as usize + 1) * rlen]
-                        .copy_from_slice(&old[off..off + rlen]);
+
+        with_exclusive_lock(&self.cal_path, || {
+            // 1) 合并磁盘上其他进程已 ensure 的日期，保证 t 基于最新全局日历计算
+            if self.cal_path.exists() {
+                if let Ok(on_disk) = TradingCalendar::load(&self.cal_path) {
+                    let mut cal = self.cal.write().unwrap();
+                    cal.merge(&on_disk);
                 }
             }
-        }
-        // 4) 写入新记录(覆盖同槽位)
-        for rec in &recs {
-            let t = rec.t as usize;
-            if t >= n {
-                continue;
-            }
-            let ordered: Vec<Value> = rec
-                .layout
+            // 2) append-only 扩展日历: 所有行的 date 纳入, 返回其全局 t
+            let mut cal = self.cal.write().unwrap();
+            let mut recs: Vec<Record> = records
                 .iter()
-                .map(|(name, _)| rec.get(table, name).cloned().unwrap_or(Value::Null))
+                .map(|r| {
+                    let t = cal.ensure(&r.date) as i64;
+                    Record {
+                        t,
+                        date: r.date.clone(),
+                        fields: r.fields.clone(),
+                        layout: r.layout.clone(),
+                    }
+                })
                 .collect();
-            let row = encode_row(&layout::Record {
-                t: rec.t,
-                fields: ordered,
-                layout: rec.layout.clone(),
-            });
-            buf[t * rlen..(t + 1) * rlen].copy_from_slice(&row);
-        }
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        std::fs::write(&path, &buf)?;
-        self.mmaps.write().unwrap().remove(&path);
-        // 5) 日历已扩展, 回写 (供其他进程/票一致)
-        self.save_calendar()?;
-        Ok(n)
+            recs.sort_by_key(|r| r.t);
+            let cal_len = cal.len();
+            drop(cal);
+            // 3) 目标长度:
+            //    - 时序表(按全局交易日历对齐): 显式指定 > 日历长度 > max(t)+1
+            //    - 非时序/事件表(CompanyProfile/Announcement/AdjustEvent/RenameEvent):
+            //      仅按实际记录展开 (max_t+1)，不撑满日历，避免 cal.len() 条空壳爆炸
+            let max_t = recs.iter().map(|r| r.t).max().unwrap_or(0);
+            let n = if is_calendar_table(table) {
+                target_n
+                    .unwrap_or_else(|| (max_t as usize + 1).max(cal_len))
+            } else {
+                target_n.unwrap_or_else(|| max_t as usize + 1)
+            };
+            // 4) 在 `.dat` 排他锁内读旧 + 原子写新（杜绝两 writer 交错覆盖）
+            let result = with_exclusive_lock(&path, || {
+                let mut buf = vec![0u8; n * rlen];
+                if path.exists() {
+                    let old = std::fs::read(&path)?;
+                    let old_n = old.len() / rlen;
+                    for t in 0..old_n {
+                        let off = t * rlen;
+                        if old[off] != 1 {
+                            continue;
+                        }
+                        if (t as usize) < n {
+                            buf[t as usize * rlen..(t as usize + 1) * rlen]
+                                .copy_from_slice(&old[off..off + rlen]);
+                        }
+                    }
+                }
+                // 写入新记录(覆盖同槽位)
+                for rec in &recs {
+                    let t = rec.t as usize;
+                    if t >= n {
+                        continue;
+                    }
+                    // 按 layout 顺序重建编码字段；t 字段用重算后的 rec.t（而非 fields 里可能
+                    // 残留的旧值），保证落盘字节中 t 为正确全局交易日索引（CONTRACT §4）。
+                    let ordered: Vec<Value> = rec
+                        .layout
+                        .iter()
+                        .map(|(name, _)| {
+                            if name == "t" {
+                                Value::I64(rec.t)
+                            } else {
+                                rec.get(table, name).cloned().unwrap_or(Value::Null)
+                            }
+                        })
+                        .collect();
+                    let row = encode_row(&layout::Record {
+                        t: rec.t,
+                        fields: ordered,
+                        layout: rec.layout.clone(),
+                    });
+                    buf[t * rlen..(t + 1) * rlen].copy_from_slice(&row);
+                }
+                atomic_write(&path, &buf)?;
+                Ok::<usize, std::io::Error>(n)
+            })?;
+            self.mmaps.write().unwrap().remove(&path);
+            // 5) 日历已扩展, 回写（仍在日历锁内；save_calendar_inner 不再重复加锁）
+            self.save_calendar_inner()?;
+            Ok(result)
+        })
     }
 
     /// 将某表某票的文件重排为 `target_n` 长度 (缺槽 present=0)。
     /// 用于统一不同票的行数/cl 对齐。
+    ///
+    /// 并发安全：在 `.dat` sidecar 锁内做原子写，避免并发 repack/write 交错覆盖。
     pub fn repack(&self, table: &str, code: &str, target_n: usize) -> std::io::Result<usize> {
         let rlen = record_len(table).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "unknown table")
         })?;
         let path = self.root.join(table).join(format!("{code}.dat"));
-        let data = std::fs::read(&path)?;
-        let old_n = data.len() / rlen;
-        let mut buf = vec![0u8; target_n * rlen];
-        let copy = old_n.min(target_n);
-        buf[..copy * rlen].copy_from_slice(&data[..copy * rlen]);
-        std::fs::write(&path, &buf)?;
+        let result = with_exclusive_lock(&path, || {
+            let data = std::fs::read(&path)?;
+            let old_n = data.len() / rlen;
+            let mut buf = vec![0u8; target_n * rlen];
+            let copy = old_n.min(target_n);
+            buf[..copy * rlen].copy_from_slice(&data[..copy * rlen]);
+            atomic_write(&path, &buf)?;
+            Ok::<usize, std::io::Error>(target_n)
+        })?;
         self.mmaps.write().unwrap().remove(&path);
-        Ok(target_n)
+        Ok(result)
     }
 
-    /// 写 `.meta` (JSON: cal_len / cal_hash / table)。与 Python 引擎一致。
+    /// 写 `.meta`（JSON: cal_len / cal_hash / table），与列式落盘布局一致。
+    ///
+    /// 并发安全：在 `.meta` sidecar 锁内做原子写，避免并发写 meta 交错覆盖。
     pub fn write_meta(&self, table: &str, code: &str) -> std::io::Result<()> {
         let meta = serde_json::json!({
             "cal_len": self.calendar().len(),
@@ -357,8 +431,8 @@ impl Store {
         let s = serde_json::to_string_pretty(&meta)?;
         let dir = self.root.join(table);
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join(format!("{code}.meta")), s)?;
-        Ok(())
+        let path = dir.join(format!("{code}.meta"));
+        with_exclusive_lock(&path, || atomic_write(&path, s.as_bytes()))
     }
 
     /// 获取（并缓存）某 .dat 的 mmap。命中缓存直接返回 `Arc`，不重复映射。

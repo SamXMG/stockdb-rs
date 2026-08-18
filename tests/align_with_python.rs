@@ -23,7 +23,8 @@ fn testdata_dir() -> PathBuf {
     p
 }
 
-const SCREENER: &str = "/home/honor/Git/LIANGHUA/Screener";
+/// 相对 crate 的同级 Screener 目录 (由 CARGO_MANIFEST_DIR 推导, 跨平台, 不依赖 cwd)。
+const SCREENER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../Screener");
 
 /// 调用 python3 用 stockdb 导出 (table, code) 的全部记录。
 fn python_read(table: &str, code: &str) -> Vec<HashMap<String, serde_json::Value>> {

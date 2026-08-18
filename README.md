@@ -1,9 +1,9 @@
 # stockdb-rs
 
-A 股列式存储数据库的 **Rust 实现**：定长二进制 `.dat` + 全局交易日历 `t` 对齐 + mmap 零拷贝随机读。
-与 Python 版 [`stockdb`](https://github.com/your-org/Screener) 二进制布局 **严格 1:1 兼容**，可互相读写同一份 `.dat` 文件。
+A 股列式存储数据库的 **Rust 实现（语言中立，无宿主语言绑定）**：定长二进制 `.dat` + 全局交易日历 `t` 对齐 + mmap 零拷贝随机读。
+二进制布局为**语言中立契约**——最初以 Python 版 [`stockdb`](https://github.com/your-org/Screener) 为参考实现，二者严格 1:1 兼容，可互相读写同一份 `.dat` 文件；任何语言只要按此契约编码即可直接读写。
 
-> 定位：**纯存储库**。只负责列式存储、读写、`repack`、`.meta`，以及作为「数据库视图」的复权 / 周期聚合能力。
+> 定位：**纯存储库（语言中立）**。只负责列式存储、读写、`repack`、`.meta`，以及作为「数据库视图」的复权 / 周期聚合能力。对外暴露 Rust crate 与 C ABI 两层接口，任意语言均可通过 C ABI 调用。
 > 不负责网络采集、因子计算、选股策略等上层业务逻辑。
 
 ## 特性
@@ -12,8 +12,9 @@ A 股列式存储数据库的 **Rust 实现**：定长二进制 `.dat` + 全局�
 - **全局交易日历对齐**：所有表共用同一根 `calendar.json`，记录按 `t`（交易日索引）对齐，支持 O(1) 随机读 `read_at`。
 - **零拷贝读**：`read_mmap` 基于 `memmap2` 直接映射文件。
 - **对称读写**：`write` / `repack` / `write_meta` 与读路径字节级对称。
+- **并发写安全**：写路径（`write` / `repack` / `write_meta` / `save_calendar`）在目标文件的 sidecar `.lock` **咨询锁**保护下，走 `temp + fsync + 原子 rename` 写入——杜绝两个 writer 交错覆盖导致的数据损坏 / 丢失，且进程写中途崩溃不会留下半截文件。读路径保持无锁，依靠原子 rename 保证 reader 不会读到撕裂数据（最终一致）。**不改变磁盘格式、不破坏字节级兼容**。
 - **数据库视图（VIEW）**：复权（前 / 后复权）、回测专用严格前视隔离前复权、周 / 月 K 聚合——确定性派生，不产生 IO。
-- **兼容性保证**：所有读写 / 视图逻辑均有「Rust 输出 vs Python 读回」的字节级对齐测试，作为跨语言契约的回归保护。
+- **兼容性保证**：所有读写 / 视图逻辑均有「Rust 输出 vs 参考引擎（原 Python）读回」的字节级对齐测试，作为跨语言契约的回归保护。
 
 ## 安装
 
@@ -79,7 +80,7 @@ let weekly = aggregate_period(&bars, "week", Some(&events)); // 周 K（先 qfq 
 [ present: u8=1 ][ field_0 ][ field_1 ] ... [ field_k ]
 ```
 
-字段类型映射（与 Python `stockdb.schema._TABLE_FIELDS` / `_BOOL_FIELDS` / `_STR_W` 一致）：
+字段类型映射（与参考实现 Python `stockdb.schema._TABLE_FIELDS` 等一致）：
 
 | 类型            | struct | 字节 | 说明                      |
 | --------------- | ------ | ---- | ------------------------- |
@@ -100,7 +101,7 @@ JSON：`{ "cal_len": usize, "cal_hash": str, "table": str }`。
 
 ## 兼容性测试
 
-所有读写 / 视图逻辑均有「Rust 输出 vs Python 读回」的字节级对齐测试，作为跨语言契约的回归保护。
+所有读写 / 视图逻辑均有「Rust 输出 vs 参考引擎（原 Python）读回」的字节级对齐测试，作为跨语言契约的回归保护。
 基准数据 `testdata/` 由 `tests/gen_testdata.py`（调用本地 `Screener/stockdb` 的 `engine`）落盘，
 覆盖全部 8 张列式表（RawDailyBar / FundFlow / AdjustEvent / IndexDaily / CompanyProfile / Announcement / RenameEvent / DailySnapshot）。
 
@@ -122,20 +123,92 @@ cargo test
 ```
 src/
   lib.rs        Store: open/read/read_mmap/read_at/write/repack/write_meta
-  layout.rs     二进制编码契约 + decode/encode（与 Python 1:1）
+  layout.rs     二进制编码契约 + decode/encode（语言中立，参考 Python）
   calendar.rs   交易日历加载 + hash 指纹
   view.rs       数据库视图：复权 / 周期聚合
-  minute.rs     MinuteBar 分时块（独立 JSON 格式, 与 Python MinuteStore 兼容）
-tests/          与 Python 的跨语言对齐测试
+  minute.rs     MinuteBar 分时块（独立 JSON 格式, 语言中立契约）
+tests/          跨语言对齐测试（参考实现为 Python）
 ```
 
 ### 两张存储体系
 
 - **列式定长 `.dat`**（`ColumnStore` / `Store`）：RawDailyBar / FundFlow / AdjustEvent /
   IndexDaily / CompanyProfile / Announcement / RenameEvent / DailySnapshot，全部 8 表
-  均与 Python 字节级对齐。
+  均与参考实现（原 Python）字节级对齐。
 - **分时 JSON 块**（`MinuteStore` / `minute::MinuteStore`）：每个 `(code, date)` 一块，存于
-  `root/minute/{code}/{date}.min`，字段与 Python `schema.MinuteBar` 一致。
+  `root/minute/{code}/{date}.min`，字段与参考实现（Python `schema.MinuteBar`）一致。
+
+## 跨语言调用（C ABI 动态库）
+
+`stockdb-rs` 编译出的 cdylib 是**语言中立**的 C ABI 边界：任意有 C FFI 的语言
+（C/C++/Go/Java/Ruby/Node/Python…）均可直接加载调用，无需 RPC / 序列化 / 进程间通信。
+Rust 侧负责全部计算（数据本地、零拷贝），宿主语言只传字符串、收回结果。
+
+> **权威契约文档**：[`CONTRACT.md`](./CONTRACT.md) —— 跨语言 binding 作者的唯一依据。
+> **查询语法速查**：[`QUERY-SYNTAX.md`](./QUERY-SYNTAX.md) —— 所有符号的逐一用法、示例与常见错误。
+> 涵盖 C ABI 函数原型与内存所有权、DSL 语法与窗口函数语义、查询返回的 JSON schema、
+> 字段类型表（数据模型）、磁盘字节布局，以及兼容性与版本约定。下文为该契约的速览。
+
+```bash
+# 编译出动态库（同时产出 rlib 供测试 + cdylib 供任意语言加载）
+cargo build --release
+# 产物: target/release/stockdb_rs.dll (Windows) / libstockdb_rs.so (Linux)
+```
+
+### C ABI 契约
+
+| 函数 | 说明 |
+|------|------|
+| `stockdb_open(root)` | 打开根目录，返回句柄指针（失败 null） |
+| `stockdb_read_column_f64(handle, table, code, field, out, cap)` | 某数值列抽成连续 `f64` 缓冲，返回元素数（-1 错） |
+| `stockdb_read_at_f64(handle, table, code, t, field, out)` | 按 t O(1) 取单条某数值字段（0 成功 / -1 失败） |
+| `stockdb_query(handle, table, expr)` | 执行 DSL，返回命中行 JSON 字符串（**调用方须用 `stockdb_free_str` 释放**） |
+| `stockdb_free_str(p)` | 释放 `stockdb_query` 返回的字符串（可传 null） |
+| `stockdb_free(handle)` | 释放句柄 |
+
+`stockdb_query` 字符串进、JSON 出，与 Rust `Store::query` 完全同构；DSL 语法见 `expr`
+模块，返回的 JSON 数组每个元素含 `code` / `t` / 各字段，宿主语言自行解析。
+
+**性能路径**：宽查询 / 性能关键场景改用 `stockdb_query_bin` —— 返回命中行的**原始二进制**
+缓冲（零 JSON 序列化、类型保真、体积更小），调用端按 [CONTRACT.md](./CONTRACT.md) §2.4 / §4
+自行解码。返回的缓冲须用 `stockdb_free_buf` 释放；可用 `stockdb_schema_hash` 做 schema 版本护栏。
+
+> ### 性能建议（查询路径选型）
+> - **热路径 / 宽查询 / 回测全市场扫描 → 一律走 `query_bin`（`stockdb_query_bin`）**。
+>   命中后仅 memcpy 定长原行字节，零 `decode_row`、零 `serde_json` 物化；
+>   实测相对 JSON 路径：宽查询 ~32×、窗口谓词 ~21×、选择性查询 ~8×。
+> - **`query`（`stockdb_query`，JSON 出）→ 仅作便利 / 调试 / 外部快速接入**。
+>   其耗时瓶颈在「命中行逐行 `decode_row` + `serde_json` 序列化」，与 eval 内核无关，
+>   属 JSON 返回方式的固有成本，**不可通过优化 eval 消除**。需要在 JSON 路径再榨性能时，
+>   才考虑绕过 `serde_json::Map`/`Value` 中间表示、直接从字节拼 JSON（边际收益 ~1.5–2.5×）。
+> - 工程取舍：性能关键路径让调用端吃 `query_bin` 二进制、自行按 §4 解码；
+>   JSON 留给需要人类可读 / 临时排查的场景。
+
+### 示例：Python ctypes（仅示其一，Go/Java/C 等同签名调用）
+
+```python
+import sys
+sys.path.insert(0, "python")
+from stockdb_rs import StockDB   # ctypes 薄壳（已封装 stockdb_query / stockdb_free_str）
+
+db = StockDB("/path/to/store")            # 指向含 calendar.json 的根目录
+closes = db.read_column("RawDailyBar", "600000", "close")   # list[float]，NaN 占位空值
+c1     = db.read_at("RawDailyBar", "600000", t=1, field="close")  # O(1) 随机读
+hits   = db.query("RawDailyBar", "close>10 && ma(close,20)>close")  # DSL -> JSON 字符串
+db.close()
+```
+
+- 封装源码：`python/stockdb_rs.py`（ctypes 薄壳，`StockDB` 类，含 `read_column`/`read_at`/`query`）。
+- 端到端自检：先 `cargo run --example make_fixture` 造 `fixture/`，再 `cd python && python _selftest.py`。
+- FFI 覆盖**只读 + 查询**（`read_column` / `read_at` / `query`）；写路径仍在 Rust 侧完成，保证磁盘格式字节级兼容不被破坏。
+- 若 cdylib 不在默认路径，可用环境变量 `STOCKDB_RS_DLL` 指定绝对路径。
+
+### 可选：PyO3 原生扩展（仅 Python 用户的可选便利层）
+
+若想获得更地道的 Python 体验（`import stockdb_rs` 直接拿到原生对象、类型友好），
+可改用 [PyO3](https://pyo3.rs/) + [maturin](https://github.com/PyO3/maturin) 生成
+`.pyd` / `.so` 扩展模块。这是**可选的 Python 专属便利层**，与上面语言中立的 C ABI
+互不排斥；FFI 层的 `extern "C"` 函数可逐步迁移为 `#[pyfunction]` / `#[pymethods]`。
 
 ## License
 

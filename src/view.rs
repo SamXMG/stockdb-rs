@@ -1,10 +1,9 @@
-//! 数据库视图 —— 与 Python `stockdb/engine.py` 的派生/聚合算法严格 1:1 对应。
+//! 数据库视图 —— 语言中立派生/聚合契约（视图能力，类似 SQL VIEW）。
 //!
-//! 这些是**数据库的视图能力**(类似 SQL VIEW): 输入 raw 表 + 事件表,
-//! 输出确定性派生数据, 不产生 IO、不碰网络。
-//!   - hfq / qfq: 前/后复权日K (基于 RawDailyBar + AdjustEvent)
-//!   - qfq_at:    回测专用严格前视隔离的前复权单根
-//!   - weekly/monthly: 周/月K 聚合 (可选先 qfq 再聚合, 价格连续)
+//! 输入 raw 表 + 事件表，输出确定性派生数据，不产生 IO、不碰网络：
+//!   - hfq / qfq：前/后复权日K（基于 RawDailyBar + AdjustEvent）
+//!   - qfq_at：回测专用严格前视隔离的前复权单根
+//!   - weekly/monthly：周/月K 聚合（可选先 qfq 再聚合，价格连续）
 
 /// raw 日K 的一根 bar (价格 + 成交量 + 日期 + 全局 t)。
 #[derive(Debug, Clone)]
@@ -129,7 +128,7 @@ pub fn derive_qfq_at(bars: &[RawBar], events: &[AdjustEvent], t: usize) -> Optio
 }
 
 fn period_key(date: &str, period: &str) -> String {
-    // 与 Python _period_key 一致: week->周一 YYYY-MM-DD; month->YYYY-MM
+    // 周期键：week→周一 YYYY-MM-DD；month→YYYY-MM（升序分桶，聚合稳定）。
     use chrono::Datelike;
     let d = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").unwrap();
     match period {

@@ -21,6 +21,9 @@ fn testdata_dir() -> PathBuf {
     p
 }
 
+/// 相对 crate 的同级 Screener 目录 (由 CARGO_MANIFEST_DIR 推导, 跨平台, 不依赖 cwd)。
+const SCREENER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../Screener");
+
 fn approx(a: f64, b: f64) -> bool {
     if a.is_nan() && b.is_nan() {
         return true;
@@ -66,7 +69,7 @@ print(json.dumps(res, ensure_ascii=False))
     let out = Command::new("python3")
         .arg("-c")
         .arg(script)
-        .arg("/home/honor/Git/LIANGHUA/Screener")
+        .arg(SCREENER)
         .arg(testdata_dir().to_str().unwrap())
         .arg(mode)
         .arg(code)
