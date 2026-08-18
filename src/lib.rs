@@ -22,12 +22,15 @@ use std::sync::{Arc, RwLock};
 use memmap2::Mmap;
 
 pub use calendar::TradingCalendar;
-pub use layout::{decode_row, encode_row, record_len, field_index, FieldKind, Value};
+pub use layout::{decode_row, encode_row, record_len, field_index, field_kinds, FieldKind, Value};
 
 /// 一条记录: 全局交易日索引 t + 列式字段(按 schema 顺序) + 编码布局。
 #[derive(Debug, Clone)]
 pub struct Record {
+    /// 交易日索引 (由 `write` 内部按 `date` 经日历 ensure 得到, 落盘时定稿)。
     pub t: i64,
+    /// 交易日字符串 (yyyy-mm-dd), 供 `write` 内部 ensure 扩展日历并计算 t。
+    pub date: String,
     /// 字段值，按 schema 顺序（与 `field_kinds` 下标一致）。
     pub fields: Vec<Value>,
     /// 编码布局(保序), 供 `write`/`repack` 对称回字节。
@@ -56,8 +59,9 @@ impl Record {
 /// `mmaps` 缓存已映射文件，使 `read_at` 在多次随机读时零系统调用、零全量拷贝。
 pub struct Store {
     root: PathBuf,
-    cal: TradingCalendar,
+    cal: RwLock<TradingCalendar>,
     mmaps: RwLock<HashMap<PathBuf, Arc<Mmap>>>,
+    cal_path: PathBuf,
 }
 
 impl Store {
@@ -68,13 +72,22 @@ impl Store {
         let cal = TradingCalendar::load(&cal_path)?;
         Ok(Self {
             root,
-            cal,
+            cal: RwLock::new(cal),
             mmaps: RwLock::new(HashMap::new()),
+            cal_path,
         })
     }
 
-    pub fn calendar(&self) -> &TradingCalendar {
-        &self.cal
+    pub fn calendar(&self) -> std::sync::RwLockReadGuard<TradingCalendar> {
+        self.cal.read().unwrap()
+    }
+
+    /// 把当前(可能已扩展的)日历写回 `calendar.json`。
+    /// `write` 扩展日历后自动调用, 保证跨进程/跨票一致。
+    pub fn save_calendar(&self) -> std::io::Result<()> {
+        let cal = self.cal.read().unwrap();
+        std::fs::write(&self.cal_path, cal.to_json())?;
+        Ok(())
     }
 
     /// 判断某表某票的数据文件是否存在。
@@ -209,12 +222,12 @@ impl Store {
             let meta: serde_json::Value = serde_json::from_str(&txt)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             if let Some(h) = meta.get("cal_hash").and_then(|v| v.as_str()) {
-                if h != self.cal.hash() {
+                let cur = self.calendar().hash();
+                if h != cur {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "{table}/{code}.meta cal_hash mismatch (file={h}, cal={})",
-                            self.cal.hash()
+                            "{table}/{code}.meta cal_hash mismatch (file={h}, cal={cur})",
                         ),
                     ));
                 }
@@ -236,23 +249,54 @@ impl Store {
         let rlen = record_len(table).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "unknown table")
         })?;
-        let max_t = records.iter().map(|r| r.t).max().unwrap_or(0);
-        let n = target_n.unwrap_or((max_t as usize + 1).max(records.len()));
+        // 1) append-only 扩展日历: 所有行的 date 纳入, 返回其全局 t
+        let mut cal = self.cal.write().unwrap();
+        let mut recs: Vec<Record> = records
+            .iter()
+            .map(|r| {
+                let t = cal.ensure(&r.date) as i64;
+                Record {
+                    t,
+                    date: r.date.clone(),
+                    fields: r.fields.clone(),
+                    layout: r.layout.clone(),
+                }
+            })
+            .collect();
+        recs.sort_by_key(|r| r.t);
+        let expanded_n = cal.len();
+        drop(cal);
+        // 2) 目标长度: 显式指定 > 扩展后日历长度 > max(t)+1
+        let max_t = recs.iter().map(|r| r.t).max().unwrap_or(0);
+        let n = target_n
+            .unwrap_or_else(|| (max_t as usize + 1).max(expanded_n));
+        let path = self.root.join(table).join(format!("{code}.dat"));
+        // 3) 旧文件重排: 加载已有 present 记录, 按绝对 t 回填到新长度
         let mut buf = vec![0u8; n * rlen];
-        for rec in records {
+        if path.exists() {
+            let old = std::fs::read(&path)?;
+            let old_n = old.len() / rlen;
+            for t in 0..old_n {
+                let off = t * rlen;
+                if old[off] != 1 {
+                    continue;
+                }
+                if (t as usize) < n {
+                    buf[t as usize * rlen..(t as usize + 1) * rlen]
+                        .copy_from_slice(&old[off..off + rlen]);
+                }
+            }
+        }
+        // 4) 写入新记录(覆盖同槽位)
+        for rec in &recs {
             let t = rec.t as usize;
             if t >= n {
                 continue;
             }
-            // 按布局顺序重组字段 (列式 Vector 已保序, 直接用 layout 取对应下标)
             let ordered: Vec<Value> = rec
                 .layout
                 .iter()
-                .map(|(name, _)| {
-                    rec.get(table, name)
-                        .cloned()
-                        .unwrap_or(Value::Null)
-                })
+                .map(|(name, _)| rec.get(table, name).cloned().unwrap_or(Value::Null))
                 .collect();
             let row = encode_row(&layout::Record {
                 t: rec.t,
@@ -261,11 +305,11 @@ impl Store {
             });
             buf[t * rlen..(t + 1) * rlen].copy_from_slice(&row);
         }
-        let dir = self.root.join(table);
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(dir.join(format!("{code}.dat")), &buf)?;
-        // 写后失效该文件缓存
-        self.mmaps.write().unwrap().remove(&dir.join(format!("{code}.dat")));
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, &buf)?;
+        self.mmaps.write().unwrap().remove(&path);
+        // 5) 日历已扩展, 回写 (供其他进程/票一致)
+        self.save_calendar()?;
         Ok(n)
     }
 
@@ -289,8 +333,8 @@ impl Store {
     /// 写 `.meta` (JSON: cal_len / cal_hash / table)。与 Python 引擎一致。
     pub fn write_meta(&self, table: &str, code: &str) -> std::io::Result<()> {
         let meta = serde_json::json!({
-            "cal_len": self.cal.len(),
-            "cal_hash": self.cal.hash(),
+            "cal_len": self.calendar().len(),
+            "cal_hash": self.calendar().hash(),
             "table": table,
         });
         let s = serde_json::to_string_pretty(&meta)?;
@@ -318,6 +362,7 @@ impl Store {
         let lr = decode_row(table, row)?;
         Some(Record {
             t,
+            date: String::new(),
             fields: lr.fields,
             layout: lr.layout,
         })

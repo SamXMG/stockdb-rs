@@ -34,6 +34,24 @@ impl TradingCalendar {
         self.dates.is_empty()
     }
 
+    /// append-only 扩展: 若 `d` 不在日历, 追加到末尾并返回新 t; 否则返回已有 t。
+    /// 与 Python `Calendar.ensure` 语义一致 (全局交易日索引唯一且稳定)。
+    pub fn ensure(&mut self, d: &str) -> usize {
+        if let Some(&t) = self.index.get(d) {
+            return t;
+        }
+        let t = self.dates.len();
+        self.dates.push(d.to_string());
+        self.index.insert(d.to_string(), t);
+        t
+    }
+
+    /// 序列化回 `calendar.json` 格式 (紧凑字符串数组)。
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(&self.dates)
+            .unwrap_or_else(|_| "[]".to_string())
+    }
+
     /// date -> t (全局交易日索引)。找不到返回 None。
     pub fn date_to_t(&self, d: &str) -> Option<usize> {
         self.index.get(d).copied()
