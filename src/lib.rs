@@ -24,6 +24,16 @@ use memmap2::Mmap;
 pub use calendar::TradingCalendar;
 pub use layout::{decode_row, encode_row, record_len, field_index, field_kinds, FieldKind, Value};
 
+/// 是否为"按全局交易日历对齐"的时序表。
+/// 时序表按 `cal.len()` 展开 (缺槽 present=0)，非时序/事件表按记录数展开，
+/// 避免 CompanyProfile/Announcement/AdjustEvent/RenameEvent 被撑成 cal.len() 条空壳。
+pub fn is_calendar_table(table: &str) -> bool {
+    matches!(
+        table,
+        "RawDailyBar" | "FundFlow" | "IndexDaily" | "DailySnapshot"
+    )
+}
+
 /// 一条记录: 全局交易日索引 t + 列式字段(按 schema 顺序) + 编码布局。
 #[derive(Debug, Clone)]
 pub struct Record {
@@ -264,12 +274,19 @@ impl Store {
             })
             .collect();
         recs.sort_by_key(|r| r.t);
-        let expanded_n = cal.len();
+        let cal_len = cal.len();
         drop(cal);
-        // 2) 目标长度: 显式指定 > 扩展后日历长度 > max(t)+1
+        // 2) 目标长度:
+        //    - 时序表(按全局交易日历对齐): 显式指定 > 日历长度 > max(t)+1
+        //    - 非时序/事件表(CompanyProfile/Announcement/AdjustEvent/RenameEvent):
+        //      仅按实际记录展开 (max_t+1)，不撑满日历，避免 cal.len() 条空壳爆炸
         let max_t = recs.iter().map(|r| r.t).max().unwrap_or(0);
-        let n = target_n
-            .unwrap_or_else(|| (max_t as usize + 1).max(expanded_n));
+        let n = if is_calendar_table(table) {
+            target_n
+                .unwrap_or_else(|| (max_t as usize + 1).max(cal_len))
+        } else {
+            target_n.unwrap_or_else(|| max_t as usize + 1)
+        };
         let path = self.root.join(table).join(format!("{code}.dat"));
         // 3) 旧文件重排: 加载已有 present 记录, 按绝对 t 回填到新长度
         let mut buf = vec![0u8; n * rlen];

@@ -13,13 +13,18 @@ pub struct TradingCalendar {
 impl TradingCalendar {
     /// 从 `calendar.json` 加载（纯字符串数组）。
     /// 使用强类型 `Vec<String>` 解析，避免 `serde_json::Value` 动态开销。
+    /// 加载后**排序 + 去重**，保证日历严格升序（ISO 日期串字典序即时间序），
+    /// 修正此前 ensure 尾追加导致的乱序膨胀。
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let txt = std::fs::read_to_string(path)?;
         let arr: Vec<String> = serde_json::from_str(&txt)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let mut dates = Vec::with_capacity(arr.len());
-        let mut index = HashMap::with_capacity(arr.len());
-        for (i, d) in arr.into_iter().enumerate() {
+        let mut unique: Vec<String> = arr.into_iter().collect();
+        unique.sort();
+        unique.dedup();
+        let mut dates = Vec::with_capacity(unique.len());
+        let mut index = HashMap::with_capacity(unique.len());
+        for (i, d) in unique.into_iter().enumerate() {
             index.insert(d.clone(), i);
             dates.push(d);
         }
@@ -34,16 +39,22 @@ impl TradingCalendar {
         self.dates.is_empty()
     }
 
-    /// append-only 扩展: 若 `d` 不在日历, 追加到末尾并返回新 t; 否则返回已有 t。
+    /// append-only 扩展: 若 `d` 不在日历, 按升序插入到正确位置并返回新 t; 否则返回已有 t。
+    /// ISO 日期串可直接字典序比较, 保证日历始终严格升序 (避免乱序膨胀)。
     /// 与 Python `Calendar.ensure` 语义一致 (全局交易日索引唯一且稳定)。
     pub fn ensure(&mut self, d: &str) -> usize {
         if let Some(&t) = self.index.get(d) {
             return t;
         }
-        let t = self.dates.len();
-        self.dates.push(d.to_string());
-        self.index.insert(d.to_string(), t);
-        t
+        // 二分查找插入点 (dates 已升序)
+        let pos = self.dates.binary_search_by(|x| x.as_str().cmp(d)).unwrap_err();
+        self.dates.insert(pos, d.to_string());
+        // 重建索引 (插入后后续偏移全部 +1)
+        self.index.clear();
+        for (i, x) in self.dates.iter().enumerate() {
+            self.index.insert(x.clone(), i);
+        }
+        pos
     }
 
     /// 序列化回 `calendar.json` 格式 (紧凑字符串数组)。
