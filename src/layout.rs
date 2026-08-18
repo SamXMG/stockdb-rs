@@ -81,13 +81,32 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// 字段类型分类。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FieldKind {
     Present, // 首字节标记
     Bool,
     Str(usize),
     T,    // i64 全局交易日索引
     F64,  // float64（含 NaN 空值）
+    Scaled(f64), // 缩放整数：磁盘 i32（4 字节），读时 ÷scale 还原 f64；空值用 SCALED_NULL
+}
+
+/// 缩放整数列的空值哨兵（i32::MIN）。写时空值/NaN → 此值；读到此值 → `Value::Null` / NaN。
+pub const SCALED_NULL: i32 = i32::MIN;
+
+/// 缩放整数列的「字段名 → 缩放因子」。命中则磁盘存 i32（4 字节），否则按 f64（8 字节）。
+/// 仅纳入数值范围安全的字段（价格类 2 位小数 → 100）；成交量/成交额等可能溢出的保持 f64。
+pub const SCALED: &[(&str, f64)] = &[
+    ("open", 100.0),
+    ("high", 100.0),
+    ("low", 100.0),
+    ("close", 100.0),
+    ("prev_close", 100.0),
+    ("price", 100.0),
+];
+
+fn scaled_scale_of(name: &str) -> Option<f64> {
+    SCALED.iter().find(|(n, _)| *n == name).map(|(_, s)| *s)
 }
 
 /// 计算某表的单条记录字节长度（含首字节 present）。
@@ -107,6 +126,8 @@ pub fn record_len(table: &str) -> Option<usize> {
             n += w;
         } else if *f == "t" {
             n += 8;
+        } else if scaled_scale_of(f).is_some() {
+            n += 4; // 缩放整数 i32（4 字节）
         } else {
             n += 8; // f64
         }
@@ -130,6 +151,8 @@ pub fn field_kinds(table: &str) -> Option<Vec<(String, FieldKind)>> {
             FieldKind::Str(*w)
         } else if *f == "t" {
             FieldKind::T
+        } else if let Some(s) = scaled_scale_of(f) {
+            FieldKind::Scaled(s)
         } else {
             FieldKind::F64
         };
@@ -185,12 +208,13 @@ fn schema_arc(table: &str) -> Option<Arc<Schema>> {
     let mut offsets: Vec<(usize, FieldKind)> = Vec::with_capacity(kinds.len());
     for (_, kind) in &kinds {
         offsets.push((off, *kind));
-        off += match kind {
-            FieldKind::Bool => 1,
-            FieldKind::Str(w) => *w,
-            FieldKind::T | FieldKind::F64 => 8,
-            FieldKind::Present => 1,
-        };
+        off +=             match kind {
+                FieldKind::Bool => 1,
+                FieldKind::Str(w) => *w,
+                FieldKind::T | FieldKind::F64 => 8,
+                FieldKind::Scaled(_) => 4,
+                FieldKind::Present => 1,
+            };
     }
     let layout: Arc<[(String, char)]> = Arc::from(
         kinds
@@ -313,6 +337,17 @@ pub fn decode_row(table: &str, buf: &[u8]) -> Option<Record> {
                 off += 8;
                 Value::I64(i64::from_le_bytes(arr))
             }
+            FieldKind::Scaled(scale) => {
+                let mut arr = [0u8; 4];
+                arr.copy_from_slice(&buf[off..off + 4]);
+                off += 4;
+                let raw = i32::from_le_bytes(arr);
+                if raw == SCALED_NULL {
+                    Value::Null
+                } else {
+                    Value::F64(raw as f64 / scale)
+                }
+            }
             FieldKind::F64 => {
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(&buf[off..off + 8]);
@@ -345,6 +380,7 @@ fn format_char(kind: &FieldKind) -> char {
         FieldKind::Str(_) => 's',
         FieldKind::T => 'q',
         FieldKind::F64 => 'd',
+        FieldKind::Scaled(_) => 'I',
         FieldKind::Present => '?',
     }
 }
@@ -377,10 +413,22 @@ fn encode_value(out: &mut Vec<u8>, v: &Value, kind: &FieldKind) {
         (FieldKind::F64, Value::Null) => {
             out.extend_from_slice(&f64::NAN.to_le_bytes());
         }
+        (FieldKind::Scaled(scale), Value::F64(f)) => {
+            let raw = if f.is_nan() {
+                SCALED_NULL
+            } else {
+                (f * scale).round() as i32
+            };
+            out.extend_from_slice(&raw.to_le_bytes());
+        }
+        (FieldKind::Scaled(_), Value::Null) => {
+            out.extend_from_slice(&SCALED_NULL.to_le_bytes());
+        }
         // 缺失/类型不匹配时按空值兜底
         (FieldKind::Bool, _) => out.push(0),
         (FieldKind::Str(w), _) => out.extend_from_slice(&vec![0u8; *w]),
         (FieldKind::F64, _) => out.extend_from_slice(&f64::NAN.to_le_bytes()),
+        (FieldKind::Scaled(_), _) => out.extend_from_slice(&SCALED_NULL.to_le_bytes()),
         (FieldKind::T, _) => out.extend_from_slice(&0i64.to_le_bytes()),
         (FieldKind::Present, _) => unreachable!(),
     }
@@ -406,10 +454,11 @@ pub fn encode_row(rec: &Record) -> Vec<u8> {
 fn record_len_of(kinds: &[FieldKind]) -> usize {
     let mut n = 1usize;
     for k in kinds {
-        n += match k {
+        n +=         match k {
             FieldKind::Bool => 1,
             FieldKind::Str(w) => *w,
             FieldKind::T | FieldKind::F64 => 8,
+            FieldKind::Scaled(_) => 4,
             FieldKind::Present => 1,
         };
     }
@@ -422,6 +471,7 @@ fn kind_from_char(c: &char, name: &str) -> FieldKind {
         '?' => FieldKind::Bool,
         'q' => FieldKind::T,
         'd' => FieldKind::F64,
+        'I' => FieldKind::Scaled(scaled_scale_of(name).unwrap_or(1.0)),
         's' => {
             let w = STR_W
                 .iter()
@@ -442,7 +492,7 @@ mod tests {
     fn record_lens_canonical() {
         // 实测字节长度：801 行 × rlen == 72891 ⇒ rlen == 91
         // 801 * rlen == 72891 => rlen == 91
-        assert_eq!(record_len("RawDailyBar"), Some(91));
+        assert_eq!(record_len("RawDailyBar"), Some(75));
         // CompanyProfile: 303579 / 801 = 379
         assert_eq!(record_len("CompanyProfile"), Some(379));
         // AdjustEvent: 47259 / 801 = 59

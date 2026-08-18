@@ -24,18 +24,26 @@ __all__ = ["StockDB", "StockDBError"]
 # 参考「调用端适配接口」用 layout：(字段名, 类型元字符, 字节宽)。
 # 来源 = CONTRACT.md §3（字段类型表）。仅登记常用表作示例；
 # 其它表请按 §3 自行提供后调用 decode_rows，或直接按偏移零拷贝解码。
+# 价格类列已改为缩放整数 `I`（4 字节 i32，读时 ÷SCALE 还原），见 §3 / §4.2。
 _KNOWN_LAYOUTS = {
     "RawDailyBar": [
         ("code", "s", 16), ("t", "q", 8), ("date", "s", 10),
-        ("open", "d", 8), ("high", "d", 8), ("low", "d", 8), ("close", "d", 8),
+        ("open", "I", 4), ("high", "I", 4), ("low", "I", 4), ("close", "I", 4),
         ("volume", "d", 8), ("amount", "d", 8), ("turnover", "d", 8),
     ],
     "IndexDaily": [
         ("index_code", "s", 16), ("t", "q", 8), ("date", "s", 10),
-        ("open", "d", 8), ("high", "d", 8), ("low", "d", 8), ("close", "d", 8),
+        ("open", "I", 4), ("high", "I", 4), ("low", "I", 4), ("close", "I", 4),
         ("volume", "d", 8), ("amount", "d", 8),
     ],
 }
+
+# 缩放整数列：磁盘 i32（×scale 写入），读时 ÷scale 还原。与 Rust `layout::SCALED` 一致。
+SCALE = {
+    "open": 100.0, "high": 100.0, "low": 100.0, "close": 100.0,
+    "prev_close": 100.0, "price": 100.0,
+}
+_SCALED_NULL = -(2 ** 31)  # i32::MIN，与 Rust `layout::SCALED_NULL` 一致
 
 
 def table_layout(table):
@@ -247,6 +255,10 @@ class StockDB:
                 elif kind == "q":
                     rec[name] = struct.unpack_from("<q", buf, off)[0]
                     off += 8
+                elif kind == "I":  # 缩放整数 i32（4 字节），÷scale 还原；哨兵=None
+                    raw = struct.unpack_from("<i", buf, off)[0]
+                    off += 4
+                    rec[name] = None if raw == _SCALED_NULL else raw / SCALE.get(name, 1.0)
                 else:  # d
                     v = struct.unpack_from("<d", buf, off)[0]
                     rec[name] = None if v != v else v  # NaN 检查

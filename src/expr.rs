@@ -531,6 +531,16 @@ fn bind(e: &mut Expr, idx: &HashMap<String, usize>, wins: &mut Vec<WinSpec>) -> 
 fn read_col(row: &[u8], off_kind: &(usize, FieldKind)) -> Val {
     let (off, kind) = *off_kind;
     match kind {
+        FieldKind::Scaled(scale) => {
+            let mut a = [0u8; 4];
+            a.copy_from_slice(&row[off..off + 4]);
+            let raw = i32::from_le_bytes(a);
+            if raw == crate::layout::SCALED_NULL {
+                Val::Num(f64::NAN)
+            } else {
+                Val::Num(raw as f64 / scale)
+            }
+        }
         FieldKind::F64 => {
             let mut a = [0u8; 8];
             a.copy_from_slice(&row[off..off + 8]);
@@ -565,6 +575,16 @@ fn read_col_f64(row: &[u8], kind: FieldKind) -> f64 {
             match kind {
                 FieldKind::F64 => f64::from_le_bytes(a),
                 _ => i64::from_le_bytes(a) as f64,
+            }
+        }
+        FieldKind::Scaled(scale) => {
+            let mut a = [0u8; 4];
+            a.copy_from_slice(&row[..4]);
+            let raw = i32::from_le_bytes(a);
+            if raw == crate::layout::SCALED_NULL {
+                f64::NAN
+            } else {
+                raw as f64 / scale
             }
         }
         _ => f64::NAN,

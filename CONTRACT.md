@@ -221,6 +221,7 @@ for _ in range(n_hits):
 | `s` | 定宽字符串 | `STR_W[name]` | string |
 | `q` | i64（即 `t` 字段） | 8 | integer |
 | `d` | f64（NaN 为空） | 8 | number |
+| `I` | 缩放整数 i32（空值哨兵 `i32::MIN`，读时 ÷scale 还原 f64） | 4 | number |
 
 ### 3.1 各表字段序列（落盘顺序 = 下表顺序）
 
@@ -262,10 +263,10 @@ summary=128, url=64, reason=64, note=64, concepts=192
 
 已对 Python `struct.calcsize` 实测对齐：
 
-- `RawDailyBar` = 91
-- `CompanyProfile` = 379
-- `AdjustEvent` = 59
-- 其余各表按 §3.1 字段序列 + §3.2/§3.3 宽度累加（公式见 §4.1）。
+- `RawDailyBar` = 75（价格列 open/high/low/close 改为 4 字节缩放整数 `I`）
+- `CompanyProfile` = 379（未缩放）
+- `AdjustEvent` = 59（未缩放）
+- 其余各表按 §3.1 字段序列 + §3.2/§3.3 宽度累加（公式见 §4.1）；价格类列按 `I`(4B) 计，其余数值按 `d`(8B)。
 
 ---
 
@@ -297,6 +298,8 @@ summary=128, url=64, reason=64, note=64, concepts=192
   - 字符串：`{w}s`，定宽 `w` 字节 UTF-8，**右截断** + `\x00` 右补齐；读时按首个 `\0` 截断并 `trim`。
   - `t`：`q`，i64 全局交易日索引。
   - 其余数值：`d`，f64；**空值用 `f64::NAN` 占位**。
+  - 缩放整数：`I`，i32（4 字节）；写时 `(f64 × scale).round()`、读时 `÷ scale` 还原；
+    **空值用哨兵 `i32::MIN` 占位**（见 §3 类型表）；仅价格类列（2 位小数，scale=100）启用。
 - `encode_row`（`layout.rs`）与 `decode_row` 完全对称，可直接落盘 / 回读。
 
 ### 4.3 交易日历 `calendar.json`
@@ -316,6 +319,7 @@ summary=128, url=64, reason=64, note=64, concepts=192
 - **稳定承诺（变更须 MAJOR 版本）**：C ABI 函数签名、§2 JSON schema、§3/§4 磁盘字节布局与字段表。这些是跨语言契约，不可破坏性变更。
 - 字段**新增**通常向后兼容（旧文件多出的字段按 `null`/`NaN` 处理），但字段**重排 / 改名 / 改宽度**属破坏性变更。
 - 参考实现 Python `stockdb` 与本文 1:1；任何偏离以本文 + `layout.rs` 常量为准。
+- 本次格式演进：价格类列（open/high/low/close/prev_close/price）由 `d`(f64,8B) 改为 `I`(缩放整数,4B)，属破坏性变更，须升 MAJOR 版本并提供 `.dat` 迁移；既有数据须重新写入。
 - 仓库内含「Rust 输出 vs 参考实现回读」的字节级对齐测试，作为契约回归保护——修改 §3/§4 须同步更新。
 
 ---
