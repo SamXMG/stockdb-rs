@@ -112,6 +112,45 @@ impl StockDB {
         self.inner.exists(table, code)
     }
 
+    /// 读取稀疏 D5/D6 历史资金流，日期由全局交易日历还原。
+    fn read_flow_rows(&self, code: &str, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+        let rows = self
+            .inner
+            .read_flow(code)
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("read flow failed: {e}")))?;
+        let cal = self.inner.calendar();
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let Some(date) = cal.t_to_date(row.t as usize) else {
+                continue;
+            };
+            let d = PyDict::new_bound(py);
+            d.set_item("date", date)?;
+            d.set_item("source", crate::flow::source_name(row.source))?;
+            for (name, value) in [
+                ("main_net", row.main_net),
+                ("main_pct", row.main_pct),
+                ("xl_net", row.xl_net),
+                ("xl_pct", row.xl_pct),
+                ("r0_net", row.r0_net),
+                ("r0_pct", row.r0_pct),
+                ("turnover", row.turnover),
+                ("vol_ratio", row.vol_ratio),
+            ] {
+                if !value.is_nan() {
+                    d.set_item(name, value)?;
+                }
+            }
+            out.push(d.unbind());
+        }
+        Ok(out)
+    }
+
+    /// 某只股票是否存在稀疏 D5/D6 历史资金流。
+    fn flow_exists(&self, code: &str) -> bool {
+        self.inner.flow_exists(code)
+    }
+
     /// 全局交易日历长度（= cal_len）。
     fn cal_len(&self) -> usize {
         self.inner.calendar().len()
@@ -125,7 +164,7 @@ impl StockDB {
     /// 返回写入后的目标长度 n。
     fn write(
         &self,
-        py: Python<'_>,
+        _py: Python<'_>,
         table: &str,
         code: &str,
         rows: &Bound<PyList>,

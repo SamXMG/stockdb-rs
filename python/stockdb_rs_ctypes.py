@@ -57,6 +57,16 @@ _KNOWN_LAYOUTS = {
         ("flow_l", "d", 8), ("flow_l_pct", "I", 4), ("industry", "s", 24),
         ("concepts", "s", 192),
     ],
+    "CompanyProfile": [
+        ("code", "s", 16), ("name", "s", 32), ("former_names", "s", 64),
+        ("board", "s", 16), ("exchange", "s", 8), ("list_date", "s", 10),
+        ("delist_date", "s", 10), ("is_st", "?", 1), ("industry", "s", 24),
+        ("region", "s", 16), ("full_name", "s", 64), ("total_shares", "d", 8),
+        ("float_shares", "d", 8), ("market_cap_yi", "d", 8), ("float_cap_yi", "d", 8),
+        ("is_hs300", "?", 1), ("is_zz500", "?", 1), ("is_zz1000", "?", 1),
+        ("is_zz2000", "?", 1), ("is_finance", "?", 1), ("company_type", "s", 16),
+        ("note", "s", 64),
+    ],
 }
 
 # 缩放整数列：磁盘 i32（×scale 写入），读时 ÷scale 还原。与 Rust `layout::SCALED` 一致。

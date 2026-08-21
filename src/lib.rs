@@ -14,6 +14,7 @@
 pub mod calendar;
 pub mod expr;
 pub mod ffi;
+pub mod flow;
 pub mod layout;
 pub mod lock;
 pub mod minute;
@@ -151,6 +152,24 @@ impl Store {
     /// 判断某表某票的数据文件是否存在。
     pub fn exists(&self, table: &str, code: &str) -> bool {
         self.root.join(table).join(format!("{code}.dat")).exists()
+    }
+
+    /// 判断某只股票是否有稀疏 D5/D6 历史资金流。
+    pub fn flow_exists(&self, code: &str) -> bool {
+        self.root
+            .join("MoneyFlowHistory")
+            .join(format!("{code}.flow"))
+            .exists()
+    }
+
+    /// 读取某只股票的稀疏 D5/D6 历史资金流。
+    pub fn read_flow(&self, code: &str) -> std::io::Result<Vec<flow::FlowRow>> {
+        flow::read_file(
+            &self
+                .root
+                .join("MoneyFlowHistory")
+                .join(format!("{code}.flow")),
+        )
     }
 
     /// 读取整张表某票的全部非空记录(按 t 升序)。

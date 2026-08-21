@@ -210,6 +210,24 @@ db.close()
 `.pyd` / `.so` 扩展模块。这是**可选的 Python 专属便利层**，与上面语言中立的 C ABI
 互不排斥；FFI 层的 `extern "C"` 函数可逐步迁移为 `#[pyfunction]` / `#[pymethods]`。
 
+## 稀疏 D5/D6 历史资金流
+
+近期资金流缓存不适合写入按完整交易日历展开的 `FundFlow` 表。项目额外提供
+`MoneyFlowHistory/<code>.flow` 稀疏定长格式：只保存实际存在的交易日，日期通过
+根目录 `calendar.json` 的全局 `t` 还原。Python 可通过 PyO3
+`StockDB.read_flow_rows(code)` 读取；没有原生扩展时，上层也可以按公开文件头解码。
+
+```bash
+# 从 RawDailyBar 日期重建全局日历，并修复各股票物理槽位
+cargo run --release --bin rebuild_calendar -- /path/to/stockdb/root
+
+# 将 data/d5d6/*.json 迁移到 MoneyFlowHistory（原 JSON 不删除）
+cargo run --release --bin migrate_d5d6 -- /path/to/stockdb/root /path/to/data/d5d6
+```
+
+当前格式：32 字节文件头 + 56 字节/行；文件头包含 magic、版本、行宽和行数。
+写入采用 sidecar 咨询锁和原子替换，可重复执行迁移。
+
 ## License
 
 Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
