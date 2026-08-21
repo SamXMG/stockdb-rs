@@ -16,6 +16,7 @@ pub const STR_W: &[(&str, usize)] = &[
     ("ann_type", 16), ("name", 32), ("former_names", 64), ("full_name", 64),
     ("old_name", 32), ("new_name", 32), ("title", 128), ("summary", 128),
     ("url", 64), ("reason", 64), ("note", 64), ("concepts", 192),
+    ("group_id", 16), ("industry_name", 24),
 ];
 
 /// 各表的 bool 字段集合。
@@ -30,6 +31,7 @@ pub const BOOL_FIELDS: &[(&str, &[&str])] = &[
     ("DailySnapshot", &["is_st"]),
     ("Announcement", &[]),
     ("RenameEvent", &[]),
+    ("IndustryDaily", &[]),
 ];
 
 /// 各表字段序列（顺序即落盘顺序）。
@@ -74,6 +76,12 @@ pub const TABLE_FIELDS: &[(&str, &[&str])] = &[
         "pb", "chg60", "flow_main", "flow_main_pct",
         "flow_xl", "flow_xl_pct", "flow_l", "flow_l_pct",
         "industry", "concepts",
+    ]),
+    ("IndustryDaily", &[
+        "group_id", "t", "date", "industry_name",
+        "ret_1d", "ret_5d", "ret_20d", "relative_20d",
+        "above_ma20_rate", "advance_rate", "amount_share",
+        "member_count",
     ]),
 ];
 
@@ -122,6 +130,14 @@ pub const SCALED: &[(&str, f64)] = &[
     ("l_pct", 10000.0),
     ("mid_pct", 10000.0),
     ("small_pct", 10000.0),
+    // 行业相对强度(比率类 → ×10000)
+    ("ret_1d", 10000.0),
+    ("ret_5d", 10000.0),
+    ("ret_20d", 10000.0),
+    ("relative_20d", 10000.0),
+    ("above_ma20_rate", 10000.0),
+    ("advance_rate", 10000.0),
+    ("amount_share", 10000.0),
 ];
 
 fn scaled_scale_of(name: &str) -> Option<f64> {
@@ -523,5 +539,7 @@ mod tests {
         assert_eq!(record_len("CompanyProfile"), Some(379));
         // AdjustEvent: 47259 / 801 = 59
         assert_eq!(record_len("AdjustEvent"), Some(59));
+        // IndustryDaily: group_id(16)+t(8)+date(10)+industry_name(24)+7×scaled(28)+member_count f64(8)+present(1) = 95
+        assert_eq!(record_len("IndustryDaily"), Some(95));
     }
 }
