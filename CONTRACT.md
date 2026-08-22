@@ -262,6 +262,12 @@ for _ in range(n_hits):
 
 **IndustryDaily**: `code, t, date, industry, ret_1d, ret_5d, ret_20d, relative_20d, above_ma20_rate, advance_rate, amount_share, member_count`
 
+**FactorDaily**: `code, t, date, value, quality_flags, source_version`（`factor_id` 在文件名中）
+
+**LabelDaily**: `code, t, date, forward_return, max_drawdown, days_to_high, valid, label_version`（`label_id` 在文件名中）
+
+**SignalDaily**: `code, t, date, score, rank, entry_price, exit_price, return, max_drawdown, holding_days, selected`（`strategy_id/model_version` 在文件名中）
+
 ### 3.2 字符串字段宽度 `STR_W`（字节，`\0` 右补齐）
 
 ```
@@ -270,6 +276,8 @@ ann_date=10, announce_date=10, effective_date=10, board=16, exchange=8,
 industry=24, region=16, company_type=16, ann_type=16, name=32,
 former_names=64, full_name=64, old_name=32, new_name=32, title=128,
 summary=128, url=64, reason=64, note=64, concepts=192
+factor_id=64, label_id=32, strategy_id=32, model_version=32,
+source_version=32, label_version=32, quality_flags=16
 ```
 
 ### 3.3 bool 字段集 `BOOL_FIELDS`
@@ -279,6 +287,8 @@ summary=128, url=64, reason=64, note=64, concepts=192
 | RawDailyBar / FundFlow / AdjustEvent / IndexDaily / Announcement / RenameEvent / IndustryDaily | （无） |
 | CompanyProfile | `is_st, is_hs300, is_zz500, is_zz1000, is_zz2000, is_finance` |
 | DailySnapshot | `is_st` |
+| LabelDaily | `valid` |
+| SignalDaily | `selected` |
 
 ### 3.4 单条记录字节长度 `record_len`（含首字节 present）
 
@@ -291,6 +301,7 @@ summary=128, url=64, reason=64, note=64, concepts=192
 - `IndustryDaily` = 95（行业名 24 字节 + 7 个 6 位小数缩放列 + member_count）
 - `CompanyProfile` = 379（未缩放）
 - `AdjustEvent` = 59（未缩放）
+- `FactorDaily` = 91, `LabelDaily` = 92, `SignalDaily` = 92（维度 ID 由文件名携带，避免逐行重复存储）
 - 其余各表按 §3.1 字段序列 + §3.2/§3.3 宽度累加（公式见 §4.1）；缩放列按 `I`(4B) 计，其余数值按 `d`(8B)。
 
 ---
@@ -330,9 +341,18 @@ summary=128, url=64, reason=64, note=64, concepts=192
 
 ### 4.3 交易日历 `calendar.json`
 
-根目录 `calendar.json` 为 date 字符串数组（`["2024-01-02", ...]`）。`t` 即数组下标；`read_at_f64(table, code, t, ...)` 的 `t` 与此对齐。写操作可能扩展该数组（append 新交易日），原子写保证多写者不互相丢失。
+根目录 `calendar.json` 为 date 字符串数组（`["2024-01-02", ...]`）。`t` 即数组下标；`read_at_f64(table, code, t, ...)` 的 `t` 与此对齐。日历表写操作只允许使用已有日期或向当前尾部追加新交易日；向历史中间/开头插入会改变既有 `t`，因此由 `Store::write` 拒绝，必须先重建/重排全库。静态表（如 `CompanyProfile`）不参与全局日历，也不会创建 `calendar.json`。原子写保证多写者不互相丢失。
 
 ### 4.4 写入原子性与并发
+
+### 4.5 紧凑研究矩阵 `.mtx`
+
+`CompactFactor/`、`CompactLabel/`、`CompactSignal/` 下的 `{code}.mtx` 使用 `LHMTX001`：
+固定头 40 字节（magic/version/header_len/row_count/column_count），随后是列名表，
+数据行固定为 `t(u32)` 加各列 `f32`。列名只在文件头出现一次，NaN 表示缺失。
+该格式用于大规模回测缓存，不替代生产热路径的标准 `.dat` 表。标签列包含各 horizon 的 return、drawdown、days_to_high；同一 `t` 重复时最后一条覆盖。
+
+公式引擎生成的矩阵按公式集隔离为 `CompactFactor/<dataset>/{code}.mtx`（Label/Signal 同理）。`dataset` 只允许 ASCII 字母、数字、`-`、`_`；不同列集合不得写入同一 dataset。
 
 - 写路径（`write` / `repack` / `write_meta` / `save_calendar`）在目标文件的 sidecar `.lock` **咨询锁**保护下，走 `temp 文件 + fsync + 原子 rename`。
 - 进程写中途崩溃不会留下半截文件；读者靠原子 rename 读到完整文件（最终一致），读路径无锁。

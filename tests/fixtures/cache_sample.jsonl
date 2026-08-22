@@ -1,0 +1,3 @@
+{"code":"600000","date":"2024-01-02","factor_id":"prelude_v1","value":0.25,"quality_flags":"ok","source_version":"raw-v1"}
+{"code":"600000","date":"2024-01-03","factor_id":"prelude_v1","value":0.31,"quality_flags":"ok","source_version":"raw-v1"}
+{"code":"600000","date":"2024-01-02","factor_id":"trend_v1","value":0.11,"quality_flags":"ok","source_version":"raw-v1"}

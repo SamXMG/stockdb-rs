@@ -9,14 +9,41 @@
 
 /// 各字符串字段宽度（字节），定宽 utf-8 截断补齐。
 pub const STR_W: &[(&str, usize)] = &[
-    ("code", 16), ("index_code", 16), ("date", 10), ("ex_date", 10),
-    ("list_date", 10), ("delist_date", 10), ("ann_date", 10),
-    ("announce_date", 10), ("effective_date", 10), ("board", 16),
-    ("exchange", 8), ("industry", 24), ("region", 16), ("company_type", 16),
-    ("ann_type", 16), ("name", 32), ("former_names", 64), ("full_name", 64),
-    ("old_name", 32), ("new_name", 32), ("title", 128), ("summary", 128),
-    ("url", 64), ("reason", 64), ("note", 64), ("concepts", 192),
-    ("group_id", 16), ("industry_name", 24),
+    ("code", 16),
+    ("index_code", 16),
+    ("date", 10),
+    ("ex_date", 10),
+    ("list_date", 10),
+    ("delist_date", 10),
+    ("ann_date", 10),
+    ("announce_date", 10),
+    ("effective_date", 10),
+    ("board", 16),
+    ("exchange", 8),
+    ("industry", 24),
+    ("region", 16),
+    ("company_type", 16),
+    ("ann_type", 16),
+    ("name", 32),
+    ("former_names", 64),
+    ("full_name", 64),
+    ("old_name", 32),
+    ("new_name", 32),
+    ("title", 128),
+    ("summary", 128),
+    ("url", 64),
+    ("reason", 64),
+    ("note", 64),
+    ("concepts", 192),
+    ("group_id", 16),
+    ("industry_name", 24),
+    ("factor_id", 64),
+    ("label_id", 32),
+    ("strategy_id", 32),
+    ("model_version", 32),
+    ("source_version", 32),
+    ("label_version", 32),
+    ("quality_flags", 16),
 ];
 
 /// 各表的 bool 字段集合。
@@ -25,63 +52,210 @@ pub const BOOL_FIELDS: &[(&str, &[&str])] = &[
     ("FundFlow", &[]),
     ("AdjustEvent", &[]),
     ("IndexDaily", &[]),
-    ("CompanyProfile", &[
-        "is_st", "is_hs300", "is_zz500", "is_zz1000", "is_zz2000", "is_finance",
-    ]),
+    (
+        "CompanyProfile",
+        &[
+            "is_st",
+            "is_hs300",
+            "is_zz500",
+            "is_zz1000",
+            "is_zz2000",
+            "is_finance",
+        ],
+    ),
     ("DailySnapshot", &["is_st"]),
     ("Announcement", &[]),
     ("RenameEvent", &[]),
     ("IndustryDaily", &[]),
+    ("FactorDaily", &[]),
+    ("LabelDaily", &["valid"]),
+    ("SignalDaily", &["selected"]),
 ];
 
 /// 各表字段序列（顺序即落盘顺序）。
 pub const TABLE_FIELDS: &[(&str, &[&str])] = &[
-    ("RawDailyBar", &[
-        "code", "t", "date", "open", "high", "low", "close",
-        "volume", "amount", "turnover",
-    ]),
-    ("FundFlow", &[
-        "code", "t", "date", "main_net", "main_pct", "xl_net",
-        "xl_pct", "l_net", "l_pct", "mid_net", "mid_pct",
-        "small_net", "small_pct",
-    ]),
-    ("AdjustEvent", &[
-        "code", "ex_date", "t", "bonus_per_share",
-        "cash_per_share", "fwd_ratio",
-    ]),
-    ("IndexDaily", &[
-        "index_code", "t", "date", "open", "high", "low",
-        "close", "volume", "amount",
-    ]),
-    ("CompanyProfile", &[
-        "code", "name", "former_names", "board", "exchange",
-        "list_date", "delist_date", "is_st", "industry",
-        "region", "full_name", "total_shares", "float_shares",
-        "market_cap_yi", "float_cap_yi", "is_hs300",
-        "is_zz500", "is_zz1000", "is_zz2000", "is_finance",
-        "company_type", "note",
-    ]),
-    ("Announcement", &[
-        "code", "ann_date", "ann_type", "title", "summary",
-        "url", "t",
-    ]),
-    ("RenameEvent", &[
-        "code", "announce_date", "effective_date", "old_name",
-        "new_name", "reason", "t",
-    ]),
-    ("DailySnapshot", &[
-        "code", "date", "t", "name", "board", "is_st",
-        "price", "prev_close", "chg_pct", "vol_ratio",
-        "turnover", "market_cap_yi", "float_cap_yi", "pe",
-        "pb", "chg60", "flow_main", "flow_main_pct",
-        "flow_xl", "flow_xl_pct", "flow_l", "flow_l_pct",
-        "industry", "concepts",
-    ]),
-    ("IndustryDaily", &[
-        "code", "t", "date", "industry", "ret_1d", "ret_5d", "ret_20d",
-        "relative_20d", "above_ma20_rate", "advance_rate", "amount_share",
-        "member_count",
-    ]),
+    (
+        "RawDailyBar",
+        &[
+            "code", "t", "date", "open", "high", "low", "close", "volume", "amount", "turnover",
+        ],
+    ),
+    (
+        "FundFlow",
+        &[
+            "code",
+            "t",
+            "date",
+            "main_net",
+            "main_pct",
+            "xl_net",
+            "xl_pct",
+            "l_net",
+            "l_pct",
+            "mid_net",
+            "mid_pct",
+            "small_net",
+            "small_pct",
+        ],
+    ),
+    (
+        "AdjustEvent",
+        &[
+            "code",
+            "ex_date",
+            "t",
+            "bonus_per_share",
+            "cash_per_share",
+            "fwd_ratio",
+        ],
+    ),
+    (
+        "IndexDaily",
+        &[
+            "index_code",
+            "t",
+            "date",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "amount",
+        ],
+    ),
+    (
+        "CompanyProfile",
+        &[
+            "code",
+            "name",
+            "former_names",
+            "board",
+            "exchange",
+            "list_date",
+            "delist_date",
+            "is_st",
+            "industry",
+            "region",
+            "full_name",
+            "total_shares",
+            "float_shares",
+            "market_cap_yi",
+            "float_cap_yi",
+            "is_hs300",
+            "is_zz500",
+            "is_zz1000",
+            "is_zz2000",
+            "is_finance",
+            "company_type",
+            "note",
+        ],
+    ),
+    (
+        "Announcement",
+        &[
+            "code", "ann_date", "ann_type", "title", "summary", "url", "t",
+        ],
+    ),
+    (
+        "RenameEvent",
+        &[
+            "code",
+            "announce_date",
+            "effective_date",
+            "old_name",
+            "new_name",
+            "reason",
+            "t",
+        ],
+    ),
+    (
+        "DailySnapshot",
+        &[
+            "code",
+            "date",
+            "t",
+            "name",
+            "board",
+            "is_st",
+            "price",
+            "prev_close",
+            "chg_pct",
+            "vol_ratio",
+            "turnover",
+            "market_cap_yi",
+            "float_cap_yi",
+            "pe",
+            "pb",
+            "chg60",
+            "flow_main",
+            "flow_main_pct",
+            "flow_xl",
+            "flow_xl_pct",
+            "flow_l",
+            "flow_l_pct",
+            "industry",
+            "concepts",
+        ],
+    ),
+    (
+        "IndustryDaily",
+        &[
+            "code",
+            "t",
+            "date",
+            "industry",
+            "ret_1d",
+            "ret_5d",
+            "ret_20d",
+            "relative_20d",
+            "above_ma20_rate",
+            "advance_rate",
+            "amount_share",
+            "member_count",
+        ],
+    ),
+    // 回测缓存：按 code + 全局 t 对齐，factor/label/signal 通过字符串 ID
+    // 支持动态增加，不需要修改 schema 或重写旧因子文件。
+    (
+        "FactorDaily",
+        &[
+            "code",
+            "t",
+            "date",
+            "value",
+            "quality_flags",
+            "source_version",
+        ],
+    ),
+    (
+        "LabelDaily",
+        &[
+            "code",
+            "t",
+            "date",
+            "forward_return",
+            "max_drawdown",
+            "days_to_high",
+            "valid",
+            "label_version",
+        ],
+    ),
+    (
+        "SignalDaily",
+        &[
+            "code",
+            "t",
+            "date",
+            "score",
+            "rank",
+            "entry_price",
+            "exit_price",
+            "return",
+            "max_drawdown",
+            "holding_days",
+            "selected",
+        ],
+    ),
 ];
 
 use std::collections::HashMap;
@@ -93,8 +267,8 @@ pub enum FieldKind {
     Present, // 首字节标记
     Bool,
     Str(usize),
-    T,    // i64 全局交易日索引
-    F64,  // float64（含 NaN 空值）
+    T,           // i64 全局交易日索引
+    F64,         // float64（含 NaN 空值）
     Scaled(f64), // 缩放整数：磁盘 i32（4 字节），读时 ÷scale 还原 f64；空值用 SCALED_NULL
 }
 
@@ -242,13 +416,13 @@ fn schema_arc(table: &str) -> Option<Arc<Schema>> {
     let mut offsets: Vec<(usize, FieldKind)> = Vec::with_capacity(kinds.len());
     for (_, kind) in &kinds {
         offsets.push((off, *kind));
-        off +=             match kind {
-                FieldKind::Bool => 1,
-                FieldKind::Str(w) => *w,
-                FieldKind::T | FieldKind::F64 => 8,
-                FieldKind::Scaled(_) => 4,
-                FieldKind::Present => 1,
-            };
+        off += match kind {
+            FieldKind::Bool => 1,
+            FieldKind::Str(w) => *w,
+            FieldKind::T | FieldKind::F64 => 8,
+            FieldKind::Scaled(_) => 4,
+            FieldKind::Present => 1,
+        };
     }
     let layout: Arc<[(String, char)]> = Arc::from(
         kinds
@@ -488,7 +662,7 @@ pub fn encode_row(rec: &Record) -> Vec<u8> {
 fn record_len_of(kinds: &[FieldKind]) -> usize {
     let mut n = 1usize;
     for k in kinds {
-        n +=         match k {
+        n += match k {
             FieldKind::Bool => 1,
             FieldKind::Str(w) => *w,
             FieldKind::T | FieldKind::F64 => 8,
@@ -541,5 +715,8 @@ mod tests {
         assert_eq!(record_len("AdjustEvent"), Some(59));
         // IndustryDaily: group_id(16)+t(8)+date(10)+industry_name(24)+7×scaled(28)+member_count f64(8)+present(1) = 95
         assert_eq!(record_len("IndustryDaily"), Some(95));
+        assert_eq!(record_len("FactorDaily"), Some(91));
+        assert_eq!(record_len("LabelDaily"), Some(92));
+        assert_eq!(record_len("SignalDaily"), Some(92));
     }
 }

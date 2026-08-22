@@ -91,8 +91,7 @@ fn main() -> io::Result<()> {
                 ));
             }
             out[base..base + RAW_RECORD_LEN].copy_from_slice(row);
-            out[base + T_OFFSET..base + T_OFFSET + 8]
-                .copy_from_slice(&(t as i64).to_le_bytes());
+            out[base + T_OFFSET..base + T_OFFSET + 8].copy_from_slice(&(t as i64).to_le_bytes());
             present += 1;
         }
         let check = out

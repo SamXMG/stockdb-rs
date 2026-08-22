@@ -55,7 +55,10 @@ impl TradingCalendar {
             return t;
         }
         // 二分查找插入点 (dates 已升序)
-        let pos = self.dates.binary_search_by(|x| x.as_str().cmp(d)).unwrap_err();
+        let pos = self
+            .dates
+            .binary_search_by(|x| x.as_str().cmp(d))
+            .unwrap_err();
         self.dates.insert(pos, d.to_string());
         // 重建索引 (插入后后续偏移全部 +1)
         self.index.clear();
@@ -87,8 +90,7 @@ impl TradingCalendar {
 
     /// 序列化回 `calendar.json` 格式 (紧凑字符串数组)。
     pub fn to_json(&self) -> String {
-        serde_json::to_string(&self.dates)
-            .unwrap_or_else(|_| "[]".to_string())
+        serde_json::to_string(&self.dates).unwrap_or_else(|_| "[]".to_string())
     }
 
     /// date -> t (全局交易日索引)。找不到返回 None。

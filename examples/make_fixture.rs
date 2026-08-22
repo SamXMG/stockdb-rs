@@ -2,8 +2,8 @@
 //! "Rust 写 → cdylib → 任意语言读（示例为 C ABI）" 的端到端链路。
 //!
 //! 运行: cargo run --example make_fixture
-use stockdb_rs::{Record, Store, Value};
 use std::path::Path;
+use stockdb_rs::{Record, Store, Value};
 
 fn main() -> std::io::Result<()> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixture");

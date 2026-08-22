@@ -61,7 +61,11 @@ print(json.dumps(out, ensure_ascii=False))
         .arg(code)
         .output()
         .expect("python3");
-    assert!(out.status.success(), "py read failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "py read failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
     serde_json::from_str(s.trim()).expect("json")
 }
@@ -117,7 +121,10 @@ fn write_then_read_by_python() {
             let recs = src_store.read(table, code).unwrap();
             // 写 (target_n 取原文件行数, 保持等长)
             let rlen = stockdb_rs::record_len(table).unwrap();
-            let n = std::fs::read(src.join(table).join(format!("{code}.dat"))).unwrap().len() / rlen;
+            let n = std::fs::read(src.join(table).join(format!("{code}.dat")))
+                .unwrap()
+                .len()
+                / rlen;
             out_store.write(table, code, &recs, Some(n)).unwrap();
             out_store.write_meta(table, code).unwrap();
 
@@ -144,7 +151,10 @@ fn repack_equal_length_no_change() {
     let code = "600000";
     let recs = src_store.read(table, code).unwrap();
     let rlen = stockdb_rs::record_len(table).unwrap();
-    let n = std::fs::read(src.join(table).join(format!("{code}.dat"))).unwrap().len() / rlen;
+    let n = std::fs::read(src.join(table).join(format!("{code}.dat")))
+        .unwrap()
+        .len()
+        / rlen;
     // repack 到相同长度, 数据应不变
     out_store.write(table, code, &recs, Some(n)).unwrap();
     out_store.repack(table, code, n).unwrap();
@@ -169,7 +179,10 @@ fn meta_matches_python() {
     let src_store = Store::open(&src).unwrap();
     let recs = src_store.read(table, code).unwrap();
     let rlen = stockdb_rs::record_len(table).unwrap();
-    let n = std::fs::read(src.join(table).join(format!("{code}.dat"))).unwrap().len() / rlen;
+    let n = std::fs::read(src.join(table).join(format!("{code}.dat")))
+        .unwrap()
+        .len()
+        / rlen;
     store.write(table, code, &recs, Some(n)).unwrap();
     store.write_meta(table, code).unwrap();
 
@@ -192,7 +205,11 @@ print(json.dumps(expected))
         .arg(code)
         .output()
         .expect("python3");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let expected: HashMap<String, serde_json::Value> =
         serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
 

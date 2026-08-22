@@ -41,7 +41,11 @@ print(json.dumps(bar.__dict__ if hasattr(bar, "__dict__") else {}))
         .arg(date)
         .output()
         .expect("python3");
-    assert!(out.status.success(), "py read: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "py read: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
     serde_json::from_str::<serde_json::Value>(s.trim())
         .ok()
@@ -49,14 +53,38 @@ print(json.dumps(bar.__dict__ if hasattr(bar, "__dict__") else {}))
         .map(|v| MinuteBar {
             code: v["code"].as_str().unwrap().to_string(),
             date: v["date"].as_str().unwrap().to_string(),
-            minutes: v["minutes"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect()).unwrap_or_default(),
-            opens: v["opens"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect()).unwrap_or_default(),
-            highs: v["highs"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect()).unwrap_or_default(),
-            lows: v["lows"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect()).unwrap_or_default(),
-            closes: v["closes"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect()).unwrap_or_default(),
-            volumes: v["volumes"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect()).unwrap_or_default(),
-            amounts: v["amounts"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect()).unwrap_or_default(),
-            avgs: v["avgs"].as_array().map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect()).unwrap_or_default(),
+            minutes: v["minutes"]
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect())
+                .unwrap_or_default(),
+            opens: v["opens"]
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect())
+                .unwrap_or_default(),
+            highs: v["highs"]
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect())
+                .unwrap_or_default(),
+            lows: v["lows"]
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect())
+                .unwrap_or_default(),
+            closes: v["closes"]
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect())
+                .unwrap_or_default(),
+            volumes: v["volumes"]
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect())
+                .unwrap_or_default(),
+            amounts: v["amounts"]
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect())
+                .unwrap_or_default(),
+            avgs: v["avgs"]
+                .as_array()
+                .map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect())
+                .unwrap_or_default(),
         })
         .expect("parse python MinuteBar")
 }
@@ -83,7 +111,11 @@ engine.MinuteStore(root).write(bar)
         .arg(&js)
         .output()
         .expect("python3");
-    assert!(out.status.success(), "py write: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "py write: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn sample(code: &str, date: &str, n: usize) -> MinuteBar {

@@ -121,14 +121,17 @@ pub fn build_hfq_cum_factors(bars: &[RawBar], events: &[AdjustEvent]) -> Vec<Big
 /// raw -> 后复权 (锚定上市日, 历史价反映真实增值)。
 pub fn derive_hfq(bars: &[RawBar], events: &[AdjustEvent]) -> Vec<Bar> {
     let factors = build_hfq_cum_factors(bars, events);
-    bars.iter().zip(factors.iter()).map(|(b, f)| Bar {
-        date: b.date.clone(),
-        open: adj_to_f64(to_cents(b.open), f),
-        high: adj_to_f64(to_cents(b.high), f),
-        low: adj_to_f64(to_cents(b.low), f),
-        close: adj_to_f64(to_cents(b.close), f),
-        volume: b.volume,
-    }).collect()
+    bars.iter()
+        .zip(factors.iter())
+        .map(|(b, f)| Bar {
+            date: b.date.clone(),
+            open: adj_to_f64(to_cents(b.open), f),
+            high: adj_to_f64(to_cents(b.high), f),
+            low: adj_to_f64(to_cents(b.low), f),
+            close: adj_to_f64(to_cents(b.close), f),
+            volume: b.volume,
+        })
+        .collect()
 }
 
 /// raw -> 前复权 (锚定最新日, 最新价 == raw 最新价; 严格无未来除权)。
@@ -138,21 +141,24 @@ pub fn derive_qfq(bars: &[RawBar], events: &[AdjustEvent]) -> Vec<Bar> {
         return Vec::new();
     }
     let latest = factors[factors.len() - 1].clone();
-    bars.iter().zip(factors.iter()).map(|(b, f)| {
-        let q = if *latest.numer() != BigInt::from(0) {
-            f / &latest
-        } else {
-            rat(1, 1)
-        };
-        Bar {
-            date: b.date.clone(),
-            open: adj_to_f64(to_cents(b.open), &q),
-            high: adj_to_f64(to_cents(b.high), &q),
-            low: adj_to_f64(to_cents(b.low), &q),
-            close: adj_to_f64(to_cents(b.close), &q),
-            volume: b.volume,
-        }
-    }).collect()
+    bars.iter()
+        .zip(factors.iter())
+        .map(|(b, f)| {
+            let q = if *latest.numer() != BigInt::from(0) {
+                f / &latest
+            } else {
+                rat(1, 1)
+            };
+            Bar {
+                date: b.date.clone(),
+                open: adj_to_f64(to_cents(b.open), &q),
+                high: adj_to_f64(to_cents(b.high), &q),
+                low: adj_to_f64(to_cents(b.low), &q),
+                close: adj_to_f64(to_cents(b.close), &q),
+                volume: b.volume,
+            }
+        })
+        .collect()
 }
 
 /// 回测专用: 严格只用 [0,T] 窗口派生第 T 根前复权价 (零前视)。
@@ -202,28 +208,36 @@ fn period_key(date: &str, period: &str) -> String {
 
 /// raw 日K -> 周K/月K (按自然周期重采样)。
 /// 若传 events 先派生 qfq 再聚合(价格连续); 否则用 raw(含除权跳变)。
-pub fn aggregate_period(
-    bars: &[RawBar],
-    period: &str,
-    events: Option<&[AdjustEvent]>,
-) -> Vec<Bar> {
+pub fn aggregate_period(bars: &[RawBar], period: &str, events: Option<&[AdjustEvent]>) -> Vec<Bar> {
     if bars.is_empty() {
         return Vec::new();
     }
     let price: Vec<Bar> = match events {
         Some(ev) => {
             let q = derive_qfq(bars, ev);
-            bars.iter().zip(q.iter()).map(|(b, s)| Bar {
-                date: b.date.clone(),
-                open: s.open, high: s.high, low: s.low, close: s.close,
-                volume: b.volume,
-            }).collect()
+            bars.iter()
+                .zip(q.iter())
+                .map(|(b, s)| Bar {
+                    date: b.date.clone(),
+                    open: s.open,
+                    high: s.high,
+                    low: s.low,
+                    close: s.close,
+                    volume: b.volume,
+                })
+                .collect()
         }
-        None => bars.iter().map(|b| Bar {
-            date: b.date.clone(),
-            open: b.open, high: b.high, low: b.low, close: b.close,
-            volume: b.volume,
-        }).collect(),
+        None => bars
+            .iter()
+            .map(|b| Bar {
+                date: b.date.clone(),
+                open: b.open,
+                high: b.high,
+                low: b.low,
+                close: b.close,
+                volume: b.volume,
+            })
+            .collect(),
     };
 
     use std::collections::HashMap;
@@ -263,7 +277,14 @@ mod tests {
     }
 
     fn bar(date: &str, o: f64, h: f64, l: f64, c: f64, v: f64) -> RawBar {
-        RawBar { date: date.into(), open: o, high: h, low: l, close: c, volume: v }
+        RawBar {
+            date: date.into(),
+            open: o,
+            high: h,
+            low: l,
+            close: c,
+            volume: v,
+        }
     }
 
     #[test]
@@ -352,8 +373,16 @@ mod tests {
             bar("2023-01-05", 30.0, 30.5, 29.8, 30.0, 1.0),
         ];
         let evs = vec![
-            AdjustEvent { ex_date: "2023-01-04".into(), bonus_per_share: 0.5, cash_per_share: 0.0 },
-            AdjustEvent { ex_date: "2023-01-05".into(), bonus_per_share: 0.0, cash_per_share: 2.0 },
+            AdjustEvent {
+                ex_date: "2023-01-04".into(),
+                bonus_per_share: 0.5,
+                cash_per_share: 0.0,
+            },
+            AdjustEvent {
+                ex_date: "2023-01-05".into(),
+                bonus_per_share: 0.0,
+                cash_per_share: 2.0,
+            },
         ];
         let hfq = derive_hfq(&bars, &evs);
         let qfq = derive_qfq(&bars, &evs);
@@ -375,8 +404,16 @@ mod tests {
             bar("2023-01-05", 10.5, 10.7, 10.2, 10.4, 1.0),
         ];
         let evs = vec![
-            AdjustEvent { ex_date: "2023-01-04".into(), bonus_per_share: 0.5, cash_per_share: 0.0 },
-            AdjustEvent { ex_date: "2023-01-05".into(), bonus_per_share: 0.0, cash_per_share: 2.0 },
+            AdjustEvent {
+                ex_date: "2023-01-04".into(),
+                bonus_per_share: 0.5,
+                cash_per_share: 0.0,
+            },
+            AdjustEvent {
+                ex_date: "2023-01-05".into(),
+                bonus_per_share: 0.0,
+                cash_per_share: 2.0,
+            },
         ];
         let a = derive_hfq(&bars, &evs);
         let b = derive_hfq(&bars, &evs);
@@ -389,4 +426,3 @@ mod tests {
         }
     }
 }
-

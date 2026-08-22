@@ -1,5 +1,7 @@
 # stockdb-rs
 
+> AI/自动化代理先读 [`AI_GUIDE.md`](AI_GUIDE.md)；项目级本地优先开发规则见 `../screener_cn/docs/架构/StockDB数据库与本地优先开发指南.md`。
+
 A 股列式存储数据库的 **Rust 实现（语言中立，无宿主语言绑定）**：定长二进制 `.dat` + 全局交易日历 `t` 对齐 + mmap 零拷贝随机读。
 二进制布局为**语言中立契约**——最初以 Python 版 [`stockdb`](https://github.com/your-org/Screener) 为参考实现，二者严格 1:1 兼容，可互相读写同一份 `.dat` 文件；任何语言只要按此契约编码即可直接读写。
 
@@ -103,9 +105,9 @@ JSON：`{ "cal_len": usize, "cal_hash": str, "table": str }`。
 
 所有读写 / 视图逻辑均有「Rust 输出 vs 参考引擎（原 Python）读回」的字节级对齐测试，作为跨语言契约的回归保护。
 基准数据 `testdata/` 由 `tests/gen_testdata.py`（调用本地 `Screener/stockdb` 的 `engine`）落盘，
-覆盖全部 8 张列式表（RawDailyBar / FundFlow / AdjustEvent / IndexDaily / CompanyProfile / Announcement / RenameEvent / DailySnapshot）。
+覆盖核心列式表（RawDailyBar / FundFlow / AdjustEvent / IndexDaily / CompanyProfile / Announcement / RenameEvent / DailySnapshot / IndustryDaily），以及回测缓存表 FactorDaily / LabelDaily / SignalDaily。
 
-- `tests/align_with_python.rs` — 读路径逐表字段级对齐（8 表）
+- `tests/align_with_python.rs` — 读路径逐表字段级对齐（历史 8 表）
 - `tests/view_align.rs` — 视图数值对齐（qfq / hfq / weekly / monthly）
 - `tests/write_align.rs` — 写路径对齐（Rust 写 → Python 读回一致；repack；.meta）
 
@@ -133,7 +135,8 @@ tests/          跨语言对齐测试（参考实现为 Python）
 ### 两张存储体系
 
 - **列式定长 `.dat`**（`ColumnStore` / `Store`）：RawDailyBar / FundFlow / AdjustEvent /
-  IndexDaily / CompanyProfile / Announcement / RenameEvent / DailySnapshot，全部 8 表
+  IndexDaily / CompanyProfile / Announcement / RenameEvent / DailySnapshot / IndustryDaily /
+  FactorDaily / LabelDaily / SignalDaily
   均与参考实现（原 Python）字节级对齐。
 - **分时 JSON 块**（`MinuteStore` / `minute::MinuteStore`）：每个 `(code, date)` 一块，存于
   `root/minute/{code}/{date}.min`，字段与参考实现（Python `schema.MinuteBar`）一致。
@@ -224,6 +227,54 @@ cargo run --release --bin rebuild_calendar -- /path/to/stockdb/root
 # 将 data/d5d6/*.json 迁移到 MoneyFlowHistory（原 JSON 不删除）
 cargo run --release --bin migrate_d5d6 -- /path/to/stockdb/root /path/to/data/d5d6
 ```
+
+### Rust 原生 JSON 导入
+
+大体量 JSON 的解析、schema 映射、日历对齐和原子二进制落盘必须由 Rust 完成，
+Python 采集端不得自行编码 `.dat`/`.flow`。统一入口：
+
+```bash
+cargo run --release --bin import_json -- snapshot <root> <snapshot-json-dir>
+cargo run --release --bin import_json -- company-profile <root> <snapshot-json-dir> <industry-history.json>
+cargo run --release --bin import_json -- money-flow <root> <d5d6-json-dir>
+cargo run --release --bin import_json -- cache <root> FactorDaily <features.jsonl>
+cargo run --release --bin import_json -- cache <root> LabelDaily <labels.jsonl>
+cargo run --release --bin import_json -- cache <root> SignalDaily <signals.jsonl>
+cargo run --release --bin import_json -- compact <root> factor <wide-factor.jsonl> <factor-1,factor-2,...>
+cargo run --release --bin import_json -- compact <root> label <wide-label.jsonl> <label-1,label-2,...>
+```
+
+`Store::write` 对静态表不触碰交易日历；日历表只允许已存在日期或向尾部追加，
+禁止隐式中间插入导致全库 `t` 错位。原始 JSON 不会删除。
+
+回测缓存 JSONL 必须按 `维度ID + code` 分组排序。Rust 会流式解析并写入：
+`FactorDaily/<factor_id>__<code>.dat`、`LabelDaily/<label_id>__<code>.dat`、
+`SignalDaily/<strategy_id>__<model_version>__<code>.dat`。维度 ID 只存于文件名，
+不在每行重复保存；每个动态因子/标签/策略独立文件，新增因子不会覆盖其他因子。
+
+大规模研究缓存推荐使用 `compact`：每只股票一个 `.mtx` 文件，文件头只存一次列名，
+数据行仅为 `t(u32)+f32[]`，缺失值用 NaN。标签矩阵按 horizon 保存收益、最大回撤和到达高点交易日数；同一 `t` 重复时最后一条覆盖。该格式避免标准日历表的空槽和重复字符串。
+
+### Rust 公式引擎
+
+Python/CLI 可提交受限 DSL，Rust 直接 mmap 读取 StockDB、按股票并行计算并写 `Compact*`：
+
+```bash
+cargo run --release --bin compute_formulas -- \
+  <root> RawDailyBar examples/formulas/basic_technical.json factor 600519,000001 basic_v1
+```
+
+支持算术/比较/逻辑、标量函数 `abs/min/max/sqrt/log/exp/clip`，以及严格只使用当前及历史数据的窗口函数：
+`ma/ema/sum/std/highest/lowest/roc/ref/rsi/atr`。多个公式共享相同窗口的预计算结果。
+
+PyO3：
+
+```python
+db.compute_formulas("RawDailyBar", "600519", formulas_json, 0, None)
+db.compute_formulas_to_compact("RawDailyBar", formulas_json, None, "factor", "basic_v1")
+```
+
+第二个接口在计算期间释放 GIL，并直接写 `CompactFactor/basic_v1/`，不把全量中间数组搬回 Python。不同公式集合必须使用不同 dataset，避免覆盖其他矩阵。
 
 当前格式：32 字节文件头 + 56 字节/行；文件头包含 magic、版本、行宽和行数。
 写入采用 sidecar 咨询锁和原子替换，可重复执行迁移。

@@ -75,7 +75,11 @@ print(json.dumps(res, ensure_ascii=False))
         .arg(code)
         .output()
         .expect("python3");
-    assert!(out.status.success(), "py view failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "py view failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
     serde_json::from_str(s.trim()).expect("json")
 }
@@ -123,7 +127,13 @@ fn cmp_bars(rust: &[Bar], py: &[HashMap<String, serde_json::Value>], ctx: &str) 
     assert_eq!(rust.len(), py.len(), "len mismatch {ctx}");
     for (r, p) in rust.iter().zip(py.iter()) {
         assert_eq!(r.date, p["date"].as_str().unwrap(), "date {ctx}");
-        for (k, rv) in [("open", r.open), ("high", r.high), ("low", r.low), ("close", r.close), ("volume", r.volume)] {
+        for (k, rv) in [
+            ("open", r.open),
+            ("high", r.high),
+            ("low", r.low),
+            ("close", r.close),
+            ("volume", r.volume),
+        ] {
             let pv = p[k].as_f64().unwrap();
             assert!(approx(rv, pv), "{k} {ctx} {k}: {rv} vs {pv}");
         }

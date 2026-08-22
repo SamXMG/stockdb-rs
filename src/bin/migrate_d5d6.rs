@@ -19,7 +19,10 @@ fn num(obj: &serde_json::Map<String, J>, key: &str) -> f64 {
 }
 
 fn row_from_json(t: i64, obj: &serde_json::Map<String, J>) -> FlowRow {
-    let source = obj.get("source").and_then(|v| v.as_str()).unwrap_or("legacy_unknown");
+    let source = obj
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("legacy_unknown");
     FlowRow {
         t,
         main_net: num(obj, "main_net"),
@@ -39,7 +42,12 @@ fn main() -> io::Result<()> {
     let root = PathBuf::from(args.next().unwrap_or_else(|| "stockdb/root".to_string()));
     let cache = PathBuf::from(args.next().unwrap_or_else(|| "data/d5d6".to_string()));
     let cal_path = root.join("calendar.json");
-    let cal = TradingCalendar::load(&cal_path).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("load calendar {}: {e}", cal_path.display())))?;
+    let cal = TradingCalendar::load(&cal_path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("load calendar {}: {e}", cal_path.display()),
+        )
+    })?;
     let out_dir = root.join("MoneyFlowHistory");
     std::fs::create_dir_all(&out_dir)?;
 
@@ -49,7 +57,9 @@ fn main() -> io::Result<()> {
     let mut skipped_dates = 0usize;
     for entry in std::fs::read_dir(&cache)? {
         let path = entry?.path();
-        if path.extension().and_then(|x| x.to_str()) != Some("json") || path.file_name().and_then(|x| x.to_str()) == Some("manifest.json") {
+        if path.extension().and_then(|x| x.to_str()) != Some("json")
+            || path.file_name().and_then(|x| x.to_str()) == Some("manifest.json")
+        {
             continue;
         }
         let code = match path.file_stem().and_then(|x| x.to_str()) {
@@ -57,13 +67,24 @@ fn main() -> io::Result<()> {
             None => continue,
         };
         let txt = std::fs::read_to_string(&path)?;
-        let raw: J = serde_json::from_str(&txt).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {e}", path.display())))?;
-        let obj = match raw.as_object() { Some(x) => x, None => continue };
+        let raw: J = serde_json::from_str(&txt).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {e}", path.display()),
+            )
+        })?;
+        let obj = match raw.as_object() {
+            Some(x) => x,
+            None => continue,
+        };
         let mut out_rows = Vec::with_capacity(obj.len());
         for (date, row) in obj {
             let t = match cal.date_to_t(date) {
                 Some(t) => t as i64,
-                None => { skipped_dates += 1; continue; }
+                None => {
+                    skipped_dates += 1;
+                    continue;
+                }
             };
             if let Some(row_obj) = row.as_object() {
                 out_rows.push(row_from_json(t, row_obj));
@@ -78,7 +99,10 @@ fn main() -> io::Result<()> {
             files += 1;
         }
         if files % 250 == 0 && files > 0 {
-            eprintln!("migrated files={} rows={} skipped_dates={}", files, rows, skipped_dates);
+            eprintln!(
+                "migrated files={} rows={} skipped_dates={}",
+                files, rows, skipped_dates
+            );
         }
     }
     let info = serde_json::json!({
@@ -94,7 +118,16 @@ fn main() -> io::Result<()> {
         "source_codes": {"0":"legacy_unknown", "1":"sina_moneyflow", "2":"eastmoney_fflow", "3":"eastmoney", "4":"fuyao"},
         "stocks": manifest,
     });
-    std::fs::write(out_dir.join("manifest.json"), serde_json::to_vec_pretty(&info).map_err(io::Error::other)?)?;
-    println!("D5/D6 migration complete: files={} rows={} skipped_dates={} out={}", files, rows, skipped_dates, out_dir.display());
+    std::fs::write(
+        out_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&info).map_err(io::Error::other)?,
+    )?;
+    println!(
+        "D5/D6 migration complete: files={} rows={} skipped_dates={} out={}",
+        files,
+        rows,
+        skipped_dates,
+        out_dir.display()
+    );
     Ok(())
 }

@@ -38,11 +38,7 @@ fn tmp_root(name: &str) -> std::path::PathBuf {
     let _ = fs::remove_dir_all(&p);
     fs::create_dir_all(&p).unwrap();
     // Store::open 需要 calendar.json
-    fs::write(
-        p.join("calendar.json"),
-        "[\"2023-01-03\",\"2023-01-04\"]",
-    )
-    .unwrap();
+    fs::write(p.join("calendar.json"), "[\"2023-01-03\",\"2023-01-04\"]").unwrap();
     p
 }
 
@@ -82,16 +78,18 @@ fn write_is_atomic_and_produces_valid_file() {
 
     // 4) sidecar 锁文件应已生成（不变量：并发安全机制就位）
     assert!(
-        root.join("AdjustEvent").join(format!("{code}.dat.lock")).exists(),
+        root.join("AdjustEvent")
+            .join(format!("{code}.dat.lock"))
+            .exists(),
         "dat 锁文件应存在"
     );
-    assert!(
-        root.join("calendar.json.lock").exists(),
-        "日历锁文件应存在"
-    );
+    assert!(root.join("calendar.json.lock").exists(), "日历锁文件应存在");
     // 不应残留临时文件
     assert!(
-        !root.join("AdjustEvent").join(format!("{code}.dat.tmp")).exists(),
+        !root
+            .join("AdjustEvent")
+            .join(format!("{code}.dat.tmp"))
+            .exists(),
         "临时文件应被清理"
     );
 

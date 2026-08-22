@@ -108,10 +108,7 @@ fn ingest_one(store: &Store, min_store: &MinuteStore, model: &StockModel) -> io:
             eprintln!("[warn] 未知表 {table}, 跳过");
             continue;
         }
-        let recs: Vec<Record> = rows
-            .iter()
-            .filter_map(|r| build_record(table, r))
-            .collect();
+        let recs: Vec<Record> = rows.iter().filter_map(|r| build_record(table, r)).collect();
         if recs.is_empty() {
             continue;
         }

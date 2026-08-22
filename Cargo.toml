@@ -15,6 +15,7 @@ byteorder = "1.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
+rayon = "1.10"
 md-5 = "0.10"
 fs4 = "0.13"
 # 精确有理数：复权因子链用 BigRational 计算，"按构造精确"到分（避免 f64 累积漂移，

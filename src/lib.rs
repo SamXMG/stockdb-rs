@@ -12,9 +12,12 @@
 //!   （见 `expr::scan_eval`）；命中行的 JSON 物化 / 二进制 memcpy 由调用方按需选择。
 
 pub mod calendar;
+pub mod compact;
+pub mod context;
 pub mod expr;
 pub mod ffi;
 pub mod flow;
+pub mod labels;
 pub mod layout;
 pub mod lock;
 pub mod minute;
@@ -50,7 +53,7 @@ use crate::lock::{atomic_write, with_exclusive_lock};
 
 pub use calendar::TradingCalendar;
 pub use layout::{
-    decode_row, encode_row, record_len, field_index, field_kinds, record_layout, FieldKind, Value,
+    decode_row, encode_row, field_index, field_kinds, record_layout, record_len, FieldKind, Value,
 };
 
 /// 是否为"按全局交易日历对齐"的时序表。
@@ -59,7 +62,14 @@ pub use layout::{
 pub fn is_calendar_table(table: &str) -> bool {
     matches!(
         table,
-        "RawDailyBar" | "FundFlow" | "IndexDaily" | "DailySnapshot" | "IndustryDaily"
+        "RawDailyBar"
+            | "FundFlow"
+            | "IndexDaily"
+            | "DailySnapshot"
+            | "IndustryDaily"
+            | "FactorDaily"
+            | "LabelDaily"
+            | "SignalDaily"
     )
 }
 
@@ -122,7 +132,13 @@ impl Store {
         })
     }
 
-    pub fn calendar(&self) -> std::sync::RwLockReadGuard<TradingCalendar> {
+    /// Root path for in-crate derived-table builders.  Public language bindings
+    /// continue to expose only table/query APIs.
+    pub(crate) fn root_dir(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn calendar(&self) -> std::sync::RwLockReadGuard<'_, TradingCalendar> {
         self.cal.read().unwrap()
     }
 
@@ -202,12 +218,7 @@ impl Store {
 
     /// 批量随机读：给定若干 t，返回对应的记录（缺失/空槽跳过）。
     /// 单次映射复用，比 N 次 `read_at` 更省映射开销。
-    pub fn read_many(
-        &self,
-        table: &str,
-        code: &str,
-        ts: &[usize],
-    ) -> std::io::Result<Vec<Record>> {
+    pub fn read_many(&self, table: &str, code: &str, ts: &[usize]) -> std::io::Result<Vec<Record>> {
         let rlen = record_len(table).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "unknown table")
         })?;
@@ -306,9 +317,7 @@ impl Store {
         if len % rlen != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "{table}/{code}.dat length {len} not multiple of rlen {rlen} (corrupt?)"
-                ),
+                format!("{table}/{code}.dat length {len} not multiple of rlen {rlen} (corrupt?)"),
             ));
         }
         let meta_path = self.root.join(table).join(format!("{code}.meta"));
@@ -321,9 +330,7 @@ impl Store {
                 if h != cur {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        format!(
-                            "{table}/{code}.meta cal_hash mismatch (file={h}, cal={cur})",
-                        ),
+                        format!("{table}/{code}.meta cal_hash mismatch (file={h}, cal={cur})",),
                     ));
                 }
             }
@@ -352,6 +359,12 @@ impl Store {
         })?;
         let path = self.root.join(table).join(format!("{code}.dat"));
 
+        // 静态/事件表没有统一交易日历槽位。尤其 CompanyProfile 没有 date，
+        // 绝不能把空字符串送进 calendar.ensure，否则会污染全局日历并造成错位。
+        if !is_calendar_table(table) {
+            return self.write_non_calendar(table, &path, records, target_n, rlen);
+        }
+
         with_exclusive_lock(&self.cal_path, || {
             // 1) 合并磁盘上其他进程已 ensure 的日期，保证 t 基于最新全局日历计算
             if self.cal_path.exists() {
@@ -362,18 +375,34 @@ impl Store {
             }
             // 2) append-only 扩展日历: 所有行的 date 纳入, 返回其全局 t
             let mut cal = self.cal.write().unwrap();
-            let mut recs: Vec<Record> = records
-                .iter()
-                .map(|r| {
-                    let t = cal.ensure(&r.date) as i64;
-                    Record {
-                        t,
-                        date: r.date.clone(),
-                        fields: r.fields.clone(),
-                        layout: r.layout.clone(),
+            let mut recs: Vec<Record> = Vec::with_capacity(records.len());
+            for r in records {
+                if r.date.is_empty() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("{table}/{code}: calendar row has empty date"),
+                    ));
+                }
+                // 日历只能向末尾追加。向历史中间/开头插入会改变既有 t，
+                // 但不会自动重排全库 .dat，因此必须显式拒绝。
+                if cal.date_to_t(&r.date).is_none() {
+                    if let Some(last) = cal.t_to_date(cal.len().saturating_sub(1)) {
+                        if r.date.as_str() <= last {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!("{table}/{code}: date {} is before/equal calendar tail {}; repack required", r.date, last),
+                            ));
+                        }
                     }
-                })
-                .collect();
+                }
+                let t = cal.ensure(&r.date) as i64;
+                recs.push(Record {
+                    t,
+                    date: r.date.clone(),
+                    fields: r.fields.clone(),
+                    layout: r.layout.clone(),
+                });
+            }
             recs.sort_by_key(|r| r.t);
             let cal_len = cal.len();
             drop(cal);
@@ -383,8 +412,7 @@ impl Store {
             //      仅按实际记录展开 (max_t+1)，不撑满日历，避免 cal.len() 条空壳爆炸
             let max_t = recs.iter().map(|r| r.t).max().unwrap_or(0);
             let n = if is_calendar_table(table) {
-                target_n
-                    .unwrap_or_else(|| (max_t as usize + 1).max(cal_len))
+                target_n.unwrap_or_else(|| (max_t as usize + 1).max(cal_len))
             } else {
                 target_n.unwrap_or_else(|| max_t as usize + 1)
             };
@@ -439,6 +467,72 @@ impl Store {
             self.save_calendar_inner()?;
             Ok(result)
         })
+    }
+
+    /// 写入非日历表：使用调用方提供的 `Record.t`，不触碰 calendar.json。
+    /// CompanyProfile 通常只有 t=0 的一条静态记录；事件表则由导入器预先把
+    /// announce/effective/ex-date 映射为已有交易日索引。
+    fn write_non_calendar(
+        &self,
+        table: &str,
+        path: &std::path::Path,
+        records: &[Record],
+        target_n: Option<usize>,
+        rlen: usize,
+    ) -> std::io::Result<usize> {
+        let max_t = records
+            .iter()
+            .map(|r| r.t.max(0) as usize)
+            .max()
+            .unwrap_or(0);
+        let n = target_n.unwrap_or(max_t + 1).max(1);
+        let result = with_exclusive_lock(path, || {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut buf = vec![0u8; n * rlen];
+            if path.exists() {
+                let old = std::fs::read(path)?;
+                if old.len() % rlen != 0 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "{} length is not a multiple of record length",
+                            path.display()
+                        ),
+                    ));
+                }
+                let copy = (old.len() / rlen).min(n);
+                buf[..copy * rlen].copy_from_slice(&old[..copy * rlen]);
+            }
+            for rec in records {
+                if rec.t < 0 || rec.t as usize >= n {
+                    continue;
+                }
+                let t = rec.t as usize;
+                let ordered: Vec<Value> = rec
+                    .layout
+                    .iter()
+                    .map(|(name, _)| {
+                        if name == "t" {
+                            Value::I64(rec.t)
+                        } else {
+                            rec.get(table, name).cloned().unwrap_or(Value::Null)
+                        }
+                    })
+                    .collect();
+                let row = encode_row(&layout::Record {
+                    t: rec.t,
+                    fields: ordered,
+                    layout: rec.layout.clone(),
+                });
+                buf[t * rlen..(t + 1) * rlen].copy_from_slice(&row);
+            }
+            atomic_write(path, &buf)?;
+            Ok::<usize, std::io::Error>(n)
+        })?;
+        self.mmaps.write().unwrap().remove(path);
+        Ok(result)
     }
 
     /// 将某表某票的文件重排为 `target_n` 长度 (缺槽 present=0)。
@@ -520,5 +614,72 @@ impl Store {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod write_safety_tests {
+    use super::*;
+
+    fn blank_record(table: &str, date: &str, t: i64) -> Record {
+        let kinds = layout::field_kinds(table).unwrap();
+        let fields = kinds
+            .iter()
+            .map(|(_, k)| match k {
+                layout::FieldKind::Bool => Value::Bool(false),
+                layout::FieldKind::Str(_) => Value::Str(String::new()),
+                layout::FieldKind::T => Value::I64(t),
+                _ => Value::Null,
+            })
+            .collect();
+        Record {
+            t,
+            date: date.to_string(),
+            fields,
+            layout: layout::record_layout(table).unwrap(),
+        }
+    }
+
+    #[test]
+    fn static_write_does_not_create_calendar() {
+        let root = std::env::temp_dir().join(format!("stockdb-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        store
+            .write(
+                "CompanyProfile",
+                "600000",
+                &[blank_record("CompanyProfile", "", 0)],
+                Some(1),
+            )
+            .unwrap();
+        assert_eq!(store.calendar().len(), 0);
+        assert!(!root.join("calendar.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn calendar_rejects_historical_insertion() {
+        let root = std::env::temp_dir().join(format!("stockdb-calendar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        store
+            .write(
+                "RawDailyBar",
+                "600000",
+                &[blank_record("RawDailyBar", "2024-01-02", 0)],
+                None,
+            )
+            .unwrap();
+        let e = store
+            .write(
+                "RawDailyBar",
+                "600000",
+                &[blank_record("RawDailyBar", "2024-01-01", 0)],
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

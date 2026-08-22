@@ -102,6 +102,196 @@ impl StockDB {
         Ok(PyBytes::new_bound(py, &buf).unbind())
     }
 
+    /// 在单只股票上计算一组 DSL 公式，返回 JSON 行。
+    /// formulas_json 支持 {"name":"expression"} 或 {"formulas":[...]}。
+    #[pyo3(signature = (table, code, formulas_json, t0=0, t1=None))]
+    fn compute_formulas(
+        &self,
+        py: Python<'_>,
+        table: &str,
+        code: &str,
+        formulas_json: &str,
+        t0: usize,
+        t1: Option<usize>,
+    ) -> PyResult<String> {
+        py.allow_threads(|| {
+            crate::expr::compute_formula_rows_json(&self.inner, table, code, formulas_json, t0, t1)
+                .map_err(PyValueError::new_err)
+        })
+    }
+
+    /// 多股票并行计算 DSL 公式并直接写 CompactFactor/Label/Signal。
+    /// 计算期间释放 GIL，Python 不接收全量中间数据。
+    #[pyo3(signature = (table, formulas_json, codes=None, kind="factor", dataset="dsl"))]
+    fn compute_formulas_to_compact(
+        &self,
+        py: Python<'_>,
+        table: &str,
+        formulas_json: &str,
+        codes: Option<Vec<String>>,
+        kind: &str,
+        dataset: &str,
+    ) -> PyResult<String> {
+        let dir = match kind {
+            "factor" => "CompactFactor",
+            "label" => "CompactLabel",
+            "signal" => "CompactSignal",
+            _ => {
+                return Err(PyValueError::new_err(
+                    "kind must be factor, label or signal",
+                ))
+            }
+        };
+        if dataset.is_empty()
+            || !dataset
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        {
+            return Err(PyValueError::new_err(
+                "dataset must contain only ASCII letters, digits, '-' or '_'",
+            ));
+        }
+        let specs =
+            crate::expr::parse_formula_specs(formulas_json).map_err(PyValueError::new_err)?;
+        let out_dir = self.root.join(dir).join(dataset);
+        py.allow_threads(|| {
+            crate::expr::compute_formulas_to_compact(
+                &self.inner,
+                table,
+                &specs,
+                codes.as_deref(),
+                &out_dir,
+            )
+            .map_err(PyValueError::new_err)
+        })
+    }
+
+    /// 由 Rust 生成前瞻收益/回撤/等待时间/障碍命中标签并写 CompactLabel。
+    #[pyo3(signature = (dataset, horizon=5, codes=None, buy_cost=0.00125, sell_cost=0.00175, gain_threshold=0.03, loss_threshold=0.02, max_entry_gap=0.07, table="RawDailyBar"))]
+    fn build_forward_labels(
+        &self,
+        py: Python<'_>,
+        dataset: &str,
+        horizon: usize,
+        codes: Option<Vec<String>>,
+        buy_cost: f64,
+        sell_cost: f64,
+        gain_threshold: f64,
+        loss_threshold: f64,
+        max_entry_gap: f64,
+        table: &str,
+    ) -> PyResult<String> {
+        validate_component(dataset, "dataset")?;
+        let output = self.root.join("CompactLabel").join(dataset);
+        let config = crate::labels::ForwardLabelConfig {
+            horizon,
+            buy_cost,
+            sell_cost,
+            gain_threshold,
+            loss_threshold,
+            max_entry_gap,
+        };
+        py.allow_threads(|| {
+            crate::labels::materialize(&self.inner, table, codes.as_deref(), &output, config)
+                .map_err(PyValueError::new_err)
+        })
+    }
+
+    /// 由 Rust 读取历史资金流、IndustryDaily 和点时行业归属，写 CompactFactor 上下文矩阵。
+    #[pyo3(signature = (dataset="context_v1", codes=None, industry_history=None))]
+    fn build_context_factors(
+        &self,
+        py: Python<'_>,
+        dataset: &str,
+        codes: Option<Vec<String>>,
+        industry_history: Option<String>,
+    ) -> PyResult<String> {
+        validate_component(dataset, "dataset")?;
+        let history = industry_history.map(PathBuf::from).unwrap_or_else(|| {
+            self.root
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or(&self.root)
+                .join("data")
+                .join("industry_history.json")
+        });
+        let output = self.root.join("CompactFactor").join(dataset);
+        py.allow_threads(|| {
+            crate::context::materialize(&self.inner, codes.as_deref(), &history, &output)
+                .map_err(PyValueError::new_err)
+        })
+    }
+
+    /// 列出标准表下所有 code。
+    fn codes(&self, table: &str) -> PyResult<Vec<String>> {
+        self.inner
+            .codes(table)
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("codes failed: {e}")))
+    }
+
+    /// 列出某个 Compact dataset 的 code。
+    fn compact_codes(&self, kind: &str, dataset: &str) -> PyResult<Vec<String>> {
+        validate_component(dataset, "dataset")?;
+        let dir = self.root.join(compact_dir(kind)?).join(dataset);
+        let mut out = Vec::new();
+        if !dir.exists() {
+            return Ok(out);
+        }
+        for entry in std::fs::read_dir(&dir)
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("compact_codes failed: {e}")))?
+        {
+            let path = entry
+                .map_err(|e| PyErr::new::<PyIOError, _>(e.to_string()))?
+                .path();
+            if path.extension().and_then(|x| x.to_str()) == Some("mtx") {
+                if let Some(code) = path.file_stem().and_then(|x| x.to_str()) {
+                    out.push(code.to_string());
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// 通过 Rust 解码 Compact 矩阵，Python 不直接解释 `.mtx` 字节。
+    fn read_compact(
+        &self,
+        py: Python<'_>,
+        kind: &str,
+        dataset: &str,
+        code: &str,
+    ) -> PyResult<Py<PyDict>> {
+        validate_component(dataset, "dataset")?;
+        validate_component(code, "code")?;
+        let path = self
+            .root
+            .join(compact_dir(kind)?)
+            .join(dataset)
+            .join(format!("{code}.mtx"));
+        let matrix = crate::compact::read_file(&path)
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("read_compact failed: {e}")))?;
+        let result = PyDict::new_bound(py);
+        result.set_item("columns", matrix.columns)?;
+        result.set_item("t", matrix.rows.iter().map(|row| row.0).collect::<Vec<_>>())?;
+        let values: Vec<Vec<Option<f64>>> = matrix
+            .rows
+            .into_iter()
+            .map(|(_, row)| {
+                row.into_iter()
+                    .map(|value| {
+                        if value.is_nan() {
+                            None
+                        } else {
+                            Some(value as f64)
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        result.set_item("values", values)?;
+        Ok(result.unbind())
+    }
+
     /// 某表字段布局指纹（= CONTRACT schema_hash）。
     fn schema_hash(&self, table: &str) -> u64 {
         crate::layout::schema_hash(table)
@@ -251,6 +441,31 @@ fn value_to_py(py: Python<'_>, v: &Value) -> PyObject {
         Value::Str(s) => s.into_py(py),
         Value::Bool(b) => b.into_py(py),
         Value::Null => py.None(),
+    }
+}
+
+fn compact_dir(kind: &str) -> PyResult<&'static str> {
+    match kind {
+        "factor" => Ok("CompactFactor"),
+        "label" => Ok("CompactLabel"),
+        "signal" => Ok("CompactSignal"),
+        _ => Err(PyValueError::new_err(
+            "kind must be factor, label or signal",
+        )),
+    }
+}
+
+fn validate_component(value: &str, name: &str) -> PyResult<()> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        Err(PyValueError::new_err(format!(
+            "{name} must contain only ASCII letters, digits, '-' or '_'"
+        )))
+    } else {
+        Ok(())
     }
 }
 

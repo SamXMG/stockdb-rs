@@ -16,8 +16,11 @@
 //! 设计要点：表达式在 Rust 侧被解析成 AST 并求值，**绝不跨 FFI 回调宿主语言**；
 //! 调用方只传一次字符串、收回一次命中结果（语言中立的 request/response 契约）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::path::Path;
+use std::time::Instant;
 
+use rayon::prelude::*;
 use serde_json::Value as J;
 
 use crate::layout::FieldKind;
@@ -30,9 +33,8 @@ enum Expr {
     Num(f64),
     Str(String),
     Field(String),
-    /// 解析后绑定：列下标(在 `Record.fields` 中的位置) + 原字段名。
-    /// 窗口函数(ma/roc/ref)仍需原字段名去查预计算数组，故保留名字。
-    Col(usize, String),
+    /// 解析后绑定：列下标（在 schema 字段序列中的位置）。
+    Col(usize),
     /// 窗口函数引用（绑定后）：`win_maps` 数组下标，直接取预计算值，零每行哈希/分配。
     Win(usize),
     Fun(String, Vec<Expr>),
@@ -136,7 +138,11 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
             continue;
         }
         // 运算符
-        let two = if i + 1 < n { &b[i..i + 2] } else { &b[i..i + 1] };
+        let two = if i + 1 < n {
+            &b[i..i + 2]
+        } else {
+            &b[i..i + 1]
+        };
         let op: &'static str = match two {
             b">=" => ">=",
             b"<=" => "<=",
@@ -381,8 +387,8 @@ impl Parser {
     }
 }
 
-/// 解析表达式字符串为 AST（公开，供 `Store::query` 与测试使用）。
-pub fn parse_expr(src: &str) -> Result<Expr, String> {
+/// 解析表达式字符串为 AST（内部供查询和公式编译复用）。
+fn parse_expr(src: &str) -> Result<Expr, String> {
     let toks = tokenize(src)?;
     let mut p = Parser::new(toks);
     p.parse()
@@ -455,9 +461,10 @@ fn compare(op: BinOp, a: Val, b: Val) -> Result<Val, String> {
 }
 
 /// 窗口函数规格（绑定阶段收集，查询阶段按此顺序预计算数组）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct WinSpec {
     fun: String,
-    field: usize, // 列下标
+    fields: Vec<usize>, // 一个字段，或 atr 的 high/low/close 三字段
     k: usize,
 }
 
@@ -471,21 +478,50 @@ fn bind(e: &mut Expr, idx: &HashMap<String, usize>, wins: &mut Vec<WinSpec>) -> 
             let i = *idx
                 .get(name)
                 .ok_or_else(|| format!("unknown field: {name}"))?;
-            *e = Expr::Col(i, name.clone());
+            *e = Expr::Col(i);
             Ok(())
         }
         Expr::Fun(name, args) => {
-            if matches!(name.as_str(), "ma" | "roc" | "ref") {
-                let field = match args.first() {
-                    Some(Expr::Field(f)) => {
-                        *idx.get(f).ok_or_else(|| format!("unknown field: {f}"))?
+            let single_window = matches!(
+                name.as_str(),
+                "ma" | "ema" | "sum" | "std" | "highest" | "lowest" | "roc" | "ref" | "rsi"
+            );
+            if single_window || name == "atr" {
+                let (fields, k_arg, min_args, max_args) = if name == "atr" {
+                    let mut fields = Vec::with_capacity(3);
+                    for pos in 0..3 {
+                        let field = match args.get(pos) {
+                            Some(Expr::Field(f)) => {
+                                *idx.get(f).ok_or_else(|| format!("unknown field: {f}"))?
+                            }
+                            _ => {
+                                return Err(
+                                    "atr arguments must be atr(high,low,close,n)".to_string()
+                                )
+                            }
+                        };
+                        fields.push(field);
                     }
-                    _ => return Err(format!("{name} first argument must be a field")),
+                    (fields, 3usize, 4usize, 4usize)
+                } else {
+                    let field = match args.first() {
+                        Some(Expr::Field(f)) => {
+                            *idx.get(f).ok_or_else(|| format!("unknown field: {f}"))?
+                        }
+                        _ => return Err(format!("{name} first argument must be a field")),
+                    };
+                    let min_args = if name == "ref" { 1 } else { 2 };
+                    (vec![field], 1usize, min_args, 2usize)
                 };
-                let k = if args.len() >= 2 {
-                    match args.get(1) {
-                        Some(Expr::Num(v)) => *v as usize,
-                        _ => return Err(format!("{name} window size must be a number")),
+                if args.len() < min_args || args.len() > max_args {
+                    return Err(format!("invalid argument count for {name}"));
+                }
+                let k = if args.len() > k_arg {
+                    match args.get(k_arg) {
+                        Some(Expr::Num(v)) if v.is_finite() && *v >= 1.0 && v.fract() == 0.0 => {
+                            *v as usize
+                        }
+                        _ => return Err(format!("{name} window size must be a positive integer")),
                     }
                 } else {
                     1
@@ -493,13 +529,13 @@ fn bind(e: &mut Expr, idx: &HashMap<String, usize>, wins: &mut Vec<WinSpec>) -> 
                 // 相同 (fun, field, k) 只预计算一次（去重）。
                 let wi = match wins
                     .iter()
-                    .position(|w| w.fun == *name && w.field == field && w.k == k)
+                    .position(|w| w.fun == *name && w.fields == fields && w.k == k)
                 {
                     Some(p) => p,
                     None => {
                         wins.push(WinSpec {
                             fun: name.clone(),
-                            field,
+                            fields,
                             k,
                         });
                         wins.len() - 1
@@ -508,6 +544,15 @@ fn bind(e: &mut Expr, idx: &HashMap<String, usize>, wins: &mut Vec<WinSpec>) -> 
                 *e = Expr::Win(wi);
                 Ok(())
             } else {
+                let expected = match name.as_str() {
+                    "abs" | "sqrt" | "log" | "exp" => 1,
+                    "min" | "max" => 2,
+                    "clip" => 3,
+                    other => return Err(format!("unknown function: {other}")),
+                };
+                if args.len() != expected {
+                    return Err(format!("{name} expects {expected} arguments"));
+                }
                 for a in args {
                     bind(a, idx, wins)?;
                 }
@@ -606,7 +651,7 @@ fn eval_byte(e: &Expr, ctx: &ByteCtx) -> Result<Val, String> {
         Expr::Num(v) => Ok(Val::Num(*v)),
         Expr::Str(s) => Ok(Val::Str(s.clone())),
         Expr::Field(name) => Err(format!("internal: unbound field {name} in byte eval")),
-        Expr::Col(i, _) => Ok(read_col(ctx.row, &ctx.cols[*i])),
+        Expr::Col(i) => Ok(read_col(ctx.row, &ctx.cols[*i])),
         Expr::Win(wi) => Ok(Val::Num(
             ctx.windows
                 .get(*wi)
@@ -625,8 +670,12 @@ fn eval_byte(e: &Expr, ctx: &ByteCtx) -> Result<Val, String> {
             }
         }
         Expr::Binary(op, l, r) => match op {
-            BinOp::And => Ok(Val::Bool(truthy(&eval_byte(l, ctx)?) && truthy(&eval_byte(r, ctx)?))),
-            BinOp::Or => Ok(Val::Bool(truthy(&eval_byte(l, ctx)?) || truthy(&eval_byte(r, ctx)?))),
+            BinOp::And => Ok(Val::Bool(
+                truthy(&eval_byte(l, ctx)?) && truthy(&eval_byte(r, ctx)?),
+            )),
+            BinOp::Or => Ok(Val::Bool(
+                truthy(&eval_byte(l, ctx)?) || truthy(&eval_byte(r, ctx)?),
+            )),
             BinOp::Eq | BinOp::Ne | BinOp::Gt | BinOp::Lt | BinOp::Ge | BinOp::Le => {
                 let a = eval_byte(l, ctx)?;
                 let b = eval_byte(r, ctx)?;
@@ -656,6 +705,15 @@ fn eval_byte(e: &Expr, ctx: &ByteCtx) -> Result<Val, String> {
                 let b = eval_byte(&args[1], ctx)?;
                 Ok(Val::Num(num(&a)?.max(num(&b)?)))
             }
+            "sqrt" => Ok(Val::Num(num(&eval_byte(&args[0], ctx)?)?.sqrt())),
+            "log" => Ok(Val::Num(num(&eval_byte(&args[0], ctx)?)?.ln())),
+            "exp" => Ok(Val::Num(num(&eval_byte(&args[0], ctx)?)?.exp())),
+            "clip" => {
+                let value = num(&eval_byte(&args[0], ctx)?)?;
+                let low = num(&eval_byte(&args[1], ctx)?)?;
+                let high = num(&eval_byte(&args[2], ctx)?)?;
+                Ok(Val::Num(value.clamp(low, high)))
+            }
             other => Err(format!("unknown function: {other}")),
         },
     }
@@ -663,39 +721,481 @@ fn eval_byte(e: &Expr, ctx: &ByteCtx) -> Result<Val, String> {
 
 // ---------------- 窗口函数预计算 ----------------
 
-/// 对一个 code 的某字段序列预计算窗口函数（ma/roc/ref）。
-fn compute_windows(series: &[f64], fun: &str, k: usize) -> Vec<f64> {
+fn rolling_sum_stats(series: &[f64], k: usize) -> (Vec<f64>, Vec<f64>, Vec<usize>) {
     let len = series.len();
+    let mut sums = vec![0.0; len];
+    let mut squares = vec![0.0; len];
+    let mut invalids = vec![0usize; len];
+    let mut sum = 0.0;
+    let mut square = 0.0;
+    let mut invalid = 0usize;
+    for i in 0..len {
+        let value = series[i];
+        if value.is_finite() {
+            sum += value;
+            square += value * value;
+        } else {
+            invalid += 1;
+        }
+        if i >= k {
+            let old = series[i - k];
+            if old.is_finite() {
+                sum -= old;
+                square -= old * old;
+            } else {
+                invalid -= 1;
+            }
+        }
+        sums[i] = sum;
+        squares[i] = square;
+        invalids[i] = invalid;
+    }
+    (sums, squares, invalids)
+}
+
+fn rolling_extreme(series: &[f64], k: usize, highest: bool) -> Vec<f64> {
+    let mut out = vec![f64::NAN; series.len()];
+    let mut deque: VecDeque<usize> = VecDeque::new();
+    let (_, _, invalids) = rolling_sum_stats(series, k);
+    for i in 0..series.len() {
+        while deque.front().is_some_and(|&j| j + k <= i) {
+            deque.pop_front();
+        }
+        if series[i].is_finite() {
+            while let Some(&j) = deque.back() {
+                let replace = if highest {
+                    series[j] <= series[i]
+                } else {
+                    series[j] >= series[i]
+                };
+                if !replace {
+                    break;
+                }
+                deque.pop_back();
+            }
+            deque.push_back(i);
+        }
+        if i + 1 >= k && invalids[i] == 0 {
+            if let Some(&j) = deque.front() {
+                out[i] = series[j];
+            }
+        }
+    }
+    out
+}
+
+/// 对一个 code 的字段序列预计算窗口函数。
+fn compute_window(series: &[&[f64]], fun: &str, k: usize) -> Vec<f64> {
+    let len = series.first().map_or(0, |x| x.len());
     let mut out = vec![f64::NAN; len];
     match fun {
-        "ma" => {
-            let mut sum = 0.0;
-            for i in 0..len {
-                sum += series[i];
-                if i >= k {
-                    sum -= series[i - k];
+        "ma" | "sum" | "std" => {
+            let (sums, squares, invalids) = rolling_sum_stats(series[0], k);
+            for i in k.saturating_sub(1)..len {
+                if invalids[i] == 0 {
+                    out[i] = match fun {
+                        "ma" => sums[i] / k as f64,
+                        "sum" => sums[i],
+                        _ => {
+                            let mean = sums[i] / k as f64;
+                            (squares[i] / k as f64 - mean * mean).max(0.0).sqrt()
+                        }
+                    };
                 }
-                if i >= k - 1 {
-                    out[i] = sum / (k as f64);
+            }
+        }
+        "ema" => {
+            let alpha = 2.0 / (k as f64 + 1.0);
+            let mut ema = f64::NAN;
+            for (i, &value) in series[0].iter().enumerate() {
+                if !value.is_finite() {
+                    continue;
                 }
+                ema = if ema.is_finite() {
+                    alpha * value + (1.0 - alpha) * ema
+                } else {
+                    value
+                };
+                out[i] = ema;
             }
         }
         "roc" => {
             for i in k..len {
-                let base = series[i - k];
-                if base != 0.0 && !base.is_nan() {
-                    out[i] = series[i] / base - 1.0;
+                let base = series[0][i - k];
+                let value = series[0][i];
+                if base != 0.0 && base.is_finite() && value.is_finite() {
+                    out[i] = value / base - 1.0;
                 }
             }
         }
         "ref" => {
             for i in k..len {
-                out[i] = series[i - k];
+                out[i] = series[0][i - k];
+            }
+        }
+        "highest" => return rolling_extreme(series[0], k, true),
+        "lowest" => return rolling_extreme(series[0], k, false),
+        "rsi" => {
+            if len <= k {
+                return out;
+            }
+            let mut gain = 0.0;
+            let mut loss = 0.0;
+            for i in 1..=k {
+                let change = series[0][i] - series[0][i - 1];
+                if !change.is_finite() {
+                    return out;
+                }
+                if change >= 0.0 {
+                    gain += change;
+                } else {
+                    loss -= change;
+                }
+            }
+            let mut avg_gain = gain / k as f64;
+            let mut avg_loss = loss / k as f64;
+            out[k] = if avg_loss == 0.0 {
+                100.0
+            } else {
+                100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+            };
+            for i in k + 1..len {
+                let change = series[0][i] - series[0][i - 1];
+                if !change.is_finite() {
+                    continue;
+                }
+                let g = change.max(0.0);
+                let l = (-change).max(0.0);
+                avg_gain = (avg_gain * (k as f64 - 1.0) + g) / k as f64;
+                avg_loss = (avg_loss * (k as f64 - 1.0) + l) / k as f64;
+                out[i] = if avg_loss == 0.0 {
+                    100.0
+                } else {
+                    100.0 - 100.0 / (1.0 + avg_gain / avg_loss)
+                };
+            }
+        }
+        "atr" => {
+            if series.len() != 3 || len <= k {
+                return out;
+            }
+            let (high, low, close) = (series[0], series[1], series[2]);
+            let mut tr = vec![f64::NAN; len];
+            for i in 1..len {
+                if high[i].is_finite() && low[i].is_finite() && close[i - 1].is_finite() {
+                    tr[i] = (high[i] - low[i])
+                        .max((high[i] - close[i - 1]).abs())
+                        .max((low[i] - close[i - 1]).abs());
+                }
+            }
+            let seed = &tr[1..=k];
+            if seed.iter().any(|v| !v.is_finite()) {
+                return out;
+            }
+            let mut atr = seed.iter().sum::<f64>() / k as f64;
+            out[k] = atr;
+            for i in k + 1..len {
+                if tr[i].is_finite() {
+                    atr = (atr * (k as f64 - 1.0) + tr[i]) / k as f64;
+                    out[i] = atr;
+                }
             }
         }
         _ => {}
     }
     out
+}
+
+// ---------------- 批量公式计算 ----------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FormulaSpec {
+    pub name: String,
+    pub expression: String,
+}
+
+#[derive(Debug)]
+struct CompiledFormulas {
+    names: Vec<String>,
+    asts: Vec<Expr>,
+    wins: Vec<WinSpec>,
+}
+
+/// 公式 JSON 支持两种形式：
+/// `{"formulas":[{"name":"ma20","expression":"ma(close,20)"}]}` 或
+/// `{"ma20":"ma(close,20)"}`。
+pub fn parse_formula_specs(raw: &str) -> Result<Vec<FormulaSpec>, String> {
+    let root: J = serde_json::from_str(raw).map_err(|e| format!("invalid formulas json: {e}"))?;
+    let value = root.get("formulas").unwrap_or(&root);
+    let mut specs = Vec::new();
+    match value {
+        J::Array(items) => {
+            for item in items {
+                let obj = item
+                    .as_object()
+                    .ok_or_else(|| "formula item must be an object".to_string())?;
+                let name = obj.get("name").and_then(J::as_str).unwrap_or("").trim();
+                let expression = obj
+                    .get("expression")
+                    .or_else(|| obj.get("expr"))
+                    .and_then(J::as_str)
+                    .unwrap_or("")
+                    .trim();
+                if name.is_empty() || expression.is_empty() {
+                    return Err("formula requires non-empty name and expression".to_string());
+                }
+                specs.push(FormulaSpec {
+                    name: name.to_string(),
+                    expression: expression.to_string(),
+                });
+            }
+        }
+        J::Object(map) => {
+            for (name, expression) in map {
+                let expression = expression
+                    .as_str()
+                    .ok_or_else(|| format!("formula {name} must be a string"))?;
+                if name.trim().is_empty() || expression.trim().is_empty() {
+                    return Err("formula requires non-empty name and expression".to_string());
+                }
+                specs.push(FormulaSpec {
+                    name: name.clone(),
+                    expression: expression.to_string(),
+                });
+            }
+        }
+        _ => return Err("formulas must be an object or array".to_string()),
+    }
+    if specs.is_empty() {
+        return Err("at least one formula is required".to_string());
+    }
+    let mut names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+    names.sort_unstable();
+    if names.windows(2).any(|w| w[0] == w[1]) {
+        return Err("formula names must be unique".to_string());
+    }
+    Ok(specs)
+}
+
+fn compile_formulas(table: &str, specs: &[FormulaSpec]) -> Result<CompiledFormulas, String> {
+    let schema =
+        crate::layout::schema_ref(table).ok_or_else(|| format!("unknown table: {table}"))?;
+    let mut wins = Vec::new();
+    let mut asts = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let mut ast = parse_expr(&spec.expression).map_err(|e| format!("{}: {e}", spec.name))?;
+        bind(&mut ast, &schema.index, &mut wins).map_err(|e| format!("{}: {e}", spec.name))?;
+        asts.push(ast);
+    }
+    Ok(CompiledFormulas {
+        names: specs.iter().map(|s| s.name.clone()).collect(),
+        asts,
+        wins,
+    })
+}
+
+fn formula_rows_compiled(
+    store: &Store,
+    table: &str,
+    code: &str,
+    compiled: &CompiledFormulas,
+    t0: usize,
+    t1: Option<usize>,
+) -> Result<Vec<(u32, Vec<f32>)>, String> {
+    let schema =
+        crate::layout::schema_ref(table).ok_or_else(|| format!("unknown table: {table}"))?;
+    let cols = &schema.offsets;
+    let rlen = crate::layout::record_len(table).ok_or_else(|| format!("unknown table: {table}"))?;
+    let mmap = store
+        .mmap_of(table, code)
+        .map_err(|e| format!("{code}: {e}"))?;
+    let n = mmap.len() / rlen;
+    let end = t1.unwrap_or(n).min(n);
+    if t0 >= end {
+        return Ok(Vec::new());
+    }
+
+    let mut present_ts = Vec::with_capacity(end - t0);
+    let mut source_fields: Vec<usize> = compiled
+        .wins
+        .iter()
+        .flat_map(|w| w.fields.iter().copied())
+        .collect();
+    source_fields.sort_unstable();
+    source_fields.dedup();
+    let source_pos: HashMap<usize, usize> = source_fields
+        .iter()
+        .enumerate()
+        .map(|(pos, field)| (*field, pos))
+        .collect();
+    let mut sources: Vec<Vec<f64>> = source_fields
+        .iter()
+        .map(|_| Vec::with_capacity(n))
+        .collect();
+
+    // 窗口预热必须从文件起点开始，输出再按 [t0,t1) 截取，避免区间首部改变公式语义。
+    for t in 0..end {
+        if mmap[t * rlen] == 0 {
+            continue;
+        }
+        present_ts.push(t);
+        for (pos, field) in source_fields.iter().enumerate() {
+            let (off, kind) = cols[*field];
+            sources[pos].push(read_col_f64(&mmap[t * rlen + off..], kind));
+        }
+    }
+    let windows: Vec<Vec<f64>> = compiled
+        .wins
+        .iter()
+        .map(|spec| {
+            let inputs: Vec<&[f64]> = spec
+                .fields
+                .iter()
+                .map(|field| sources[source_pos[field]].as_slice())
+                .collect();
+            compute_window(&inputs, &spec.fun, spec.k)
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(present_ts.len());
+    for (k, &t) in present_ts.iter().enumerate() {
+        if t < t0 {
+            continue;
+        }
+        let row = &mmap[t * rlen..(t + 1) * rlen];
+        let ctx = ByteCtx {
+            row,
+            cols,
+            windows: &windows,
+            t: k,
+        };
+        let mut values = Vec::with_capacity(compiled.asts.len());
+        for (name, ast) in compiled.names.iter().zip(&compiled.asts) {
+            let value =
+                match eval_byte(ast, &ctx).map_err(|e| format!("{code} @t{t} {name}: {e}"))? {
+                    Val::Num(v) if v.is_finite() => v as f32,
+                    Val::Bool(v) => {
+                        if v {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    Val::Num(_) => f32::NAN,
+                    Val::Str(_) => {
+                        return Err(format!(
+                            "{code} @t{t} {name}: formula result must be numeric"
+                        ))
+                    }
+                };
+            values.push(value);
+        }
+        out.push((t as u32, values));
+    }
+    Ok(out)
+}
+
+pub fn compute_formula_rows(
+    store: &Store,
+    table: &str,
+    code: &str,
+    specs: &[FormulaSpec],
+    t0: usize,
+    t1: Option<usize>,
+) -> Result<Vec<(u32, Vec<f32>)>, String> {
+    let compiled = compile_formulas(table, specs)?;
+    formula_rows_compiled(store, table, code, &compiled, t0, t1)
+}
+
+pub fn compute_formula_rows_json(
+    store: &Store,
+    table: &str,
+    code: &str,
+    formulas_json: &str,
+    t0: usize,
+    t1: Option<usize>,
+) -> Result<String, String> {
+    let specs = parse_formula_specs(formulas_json)?;
+    let rows = compute_formula_rows(store, table, code, &specs, t0, t1)?;
+    let cal = store.calendar();
+    let items: Vec<J> = rows
+        .into_iter()
+        .map(|(t, values)| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("t".to_string(), J::Number((t as u64).into()));
+            obj.insert(
+                "date".to_string(),
+                cal.t_to_date(t as usize)
+                    .map_or(J::Null, |d| J::String(d.to_string())),
+            );
+            for (spec, value) in specs.iter().zip(values) {
+                obj.insert(
+                    spec.name.clone(),
+                    if value.is_nan() {
+                        J::Null
+                    } else {
+                        J::Number(serde_json::Number::from_f64(value as f64).unwrap())
+                    },
+                );
+            }
+            J::Object(obj)
+        })
+        .collect();
+    serde_json::to_string(&items).map_err(|e| e.to_string())
+}
+
+/// 多股票并行计算并直接写紧凑矩阵。Rust 全程读取、计算和写盘，宿主不搬运中间行。
+pub fn compute_formulas_to_compact(
+    store: &Store,
+    table: &str,
+    specs: &[FormulaSpec],
+    codes: Option<&[String]>,
+    out_dir: &Path,
+) -> Result<String, String> {
+    let started = Instant::now();
+    let compiled = compile_formulas(table, specs)?;
+    let selected = match codes {
+        Some(items) => {
+            let mut values = items.to_vec();
+            values.sort();
+            values.dedup();
+            if let Some(bad) = values.iter().find(|code| {
+                code.is_empty()
+                    || !code
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+            }) {
+                return Err(format!("invalid code for compact output: {bad}"));
+            }
+            values
+        }
+        None => store.codes(table).map_err(|e| e.to_string())?,
+    };
+    std::fs::create_dir_all(out_dir).map_err(|e| e.to_string())?;
+    let results: Result<Vec<(usize, u64)>, String> = selected
+        .par_iter()
+        .map(|code| {
+            let rows = formula_rows_compiled(store, table, code, &compiled, 0, None)?;
+            let path = out_dir.join(format!("{code}.mtx"));
+            crate::compact::write_file(&path, &compiled.names, &rows)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let bytes = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+            Ok((rows.len(), bytes))
+        })
+        .collect();
+    let results = results?;
+    let rows: usize = results.iter().map(|x| x.0).sum();
+    let bytes: u64 = results.iter().map(|x| x.1).sum();
+    serde_json::to_string(&serde_json::json!({
+        "table": table,
+        "files": results.len(),
+        "rows": rows,
+        "columns": compiled.names,
+        "bytes": bytes,
+        "elapsed_ms": started.elapsed().as_millis(),
+        "output": out_dir.to_string_lossy(),
+    }))
+    .map_err(|e| e.to_string())
 }
 
 // ---------------- 查询入口 ----------------
@@ -717,12 +1217,11 @@ where
 
     let codes = store.codes(table).map_err(|e| e.to_string())?;
     // 复用全表共享 schema：字段名下标 + 列字节偏移（避免每次查询重建 HashMap 与累加偏移）。
-    let schema = crate::layout::schema_ref(table)
-        .ok_or_else(|| format!("unknown table: {table}"))?;
+    let schema =
+        crate::layout::schema_ref(table).ok_or_else(|| format!("unknown table: {table}"))?;
     let idx = &schema.index;
     let cols = &schema.offsets;
-    let rlen = crate::layout::record_len(table)
-        .ok_or_else(|| format!("unknown table: {table}"))?;
+    let rlen = crate::layout::record_len(table).ok_or_else(|| format!("unknown table: {table}"))?;
     // 解析后把字段名绑定成列下标、把窗口函数绑定成数组下标（eval 不再每行做 HashMap 查找）。
     let mut win_specs: Vec<WinSpec> = Vec::new();
     bind(&mut ast, idx, &mut win_specs)?;
@@ -737,22 +1236,43 @@ where
         // 一遍扫描：收集非空行（present=1）的全局 t，并同时构建被引用窗口列的 f64 序列
         //（直接从字节读列值，零 `Vec<Value>` 中间表示）。
         let mut present_ts: Vec<usize> = Vec::with_capacity(n);
-        let mut win_maps: Vec<Vec<f64>> = win_specs.iter().map(|_| Vec::with_capacity(n)).collect();
+        let mut source_fields: Vec<usize> = win_specs
+            .iter()
+            .flat_map(|w| w.fields.iter().copied())
+            .collect();
+        source_fields.sort_unstable();
+        source_fields.dedup();
+        let source_pos: HashMap<usize, usize> = source_fields
+            .iter()
+            .enumerate()
+            .map(|(pos, field)| (*field, pos))
+            .collect();
+        let mut sources: Vec<Vec<f64>> = source_fields
+            .iter()
+            .map(|_| Vec::with_capacity(n))
+            .collect();
         for t in 0..n {
             if mmap[t * rlen] == 0 {
                 continue; // 空槽跳过（与旧 decode_all 行为一致）
             }
             present_ts.push(t);
-            for (wi, w) in win_specs.iter().enumerate() {
-                let (off, kind) = cols[w.field];
-                win_maps[wi].push(read_col_f64(&mmap[t * rlen + off..], kind));
+            for (pos, field) in source_fields.iter().enumerate() {
+                let (off, kind) = cols[*field];
+                sources[pos].push(read_col_f64(&mmap[t * rlen + off..], kind));
             }
         }
         // 按绑定顺序预计算每个窗口函数数组（每个 code 仅算一次，序列按非空行序号索引）。
-        for wi in 0..win_specs.len() {
-            let spec = &win_specs[wi];
-            win_maps[wi] = compute_windows(&win_maps[wi], &spec.fun, spec.k);
-        }
+        let win_maps: Vec<Vec<f64>> = win_specs
+            .iter()
+            .map(|spec| {
+                let inputs: Vec<&[f64]> = spec
+                    .fields
+                    .iter()
+                    .map(|field| sources[source_pos[field]].as_slice())
+                    .collect();
+                compute_window(&inputs, &spec.fun, spec.k)
+            })
+            .collect();
 
         // 逐非空行字节级 eval（k = 非空行序号，与窗口数组索引对齐）。
         for (k, &gt) in present_ts.iter().enumerate() {
@@ -780,8 +1300,7 @@ where
 pub fn query(store: &Store, table: &str, expr: &str) -> Result<String, String> {
     let mut results: Vec<J> = Vec::new();
     scan_eval(store, table, expr, |code, _k, row| {
-        let rec = crate::layout::decode_row(table, row)
-            .expect("present row must decode");
+        let rec = crate::layout::decode_row(table, row).expect("present row must decode");
         let mut obj = serde_json::Map::new();
         obj.insert("code".to_string(), J::String(code.to_string()));
         obj.insert("t".to_string(), J::Number((rec.t as i64).into()));
@@ -833,8 +1352,7 @@ pub fn query(store: &Store, table: &str, expr: &str) -> Result<String, String> {
 /// 中间表示。跨语言入口见 `ffi::stockdb_query_bin`（C ABI，同构；调用方须用
 /// `stockdb_free_buf` 释放）。
 pub fn query_bin(store: &Store, table: &str, expr: &str) -> Result<Vec<u8>, String> {
-    let rlen = crate::layout::record_len(table)
-        .ok_or_else(|| format!("unknown table: {table}"))?;
+    let rlen = crate::layout::record_len(table).ok_or_else(|| format!("unknown table: {table}"))?;
     let shash = crate::layout::schema_hash(table);
     let mut buf: Vec<u8> = Vec::with_capacity(24 + 4096);
     // header 占位（record_len / n_hits / schema_hash 后置回填）
@@ -863,7 +1381,12 @@ mod tests {
 
     /// 造一个临时 root（进程唯一，避免并行测试互相污染），返回路径。
     fn tmp_root(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("stockdb_test_{}_{}_{}", tag, std::process::id(), line!()));
+        let dir = std::env::temp_dir().join(format!(
+            "stockdb_test_{}_{}_{}",
+            tag,
+            std::process::id(),
+            line!()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -878,8 +1401,10 @@ mod tests {
         let store = Store::open(root).unwrap();
         let layout: Arc<[(String, char)]> = crate::layout::record_layout("RawDailyBar").unwrap();
         let dates = ["2024-01-01", "2024-01-02", "2024-01-03"];
-        let specs: &[(&str, [f64; 3])] =
-            &[("000001", [10.0, 20.0, 30.0]), ("000002", [40.0, 50.0, 60.0])];
+        let specs: &[(&str, [f64; 3])] = &[
+            ("000001", [10.0, 20.0, 30.0]),
+            ("000002", [40.0, 50.0, 60.0]),
+        ];
         for (code, closes) in specs {
             let mut recs = Vec::with_capacity(3);
             for (i, d) in dates.iter().enumerate() {
@@ -932,8 +1457,57 @@ mod tests {
         let mut wins: Vec<WinSpec> = Vec::new();
         let mut ast = e;
         bind(&mut ast, &idx, &mut wins).unwrap();
-        assert!(wins.iter().any(|w| w.fun == "ma" && w.field == 1 && w.k == 5));
-        assert!(wins.iter().any(|w| w.fun == "roc" && w.field == 0 && w.k == 20));
+        assert!(wins
+            .iter()
+            .any(|w| w.fun == "ma" && w.fields == vec![1] && w.k == 5));
+        assert!(wins
+            .iter()
+            .any(|w| w.fun == "roc" && w.fields == vec![0] && w.k == 20));
+    }
+
+    #[test]
+    fn formula_engine_computes_shared_windows() {
+        let root = tmp_root("formula");
+        make_store(&root);
+        let store = Store::open(&root).unwrap();
+        let specs = vec![
+            FormulaSpec {
+                name: "ma2".into(),
+                expression: "ma(close,2)".into(),
+            },
+            FormulaSpec {
+                name: "roc1".into(),
+                expression: "roc(close,1)".into(),
+            },
+            FormulaSpec {
+                name: "atr2".into(),
+                expression: "atr(high,low,close,2)".into(),
+            },
+            FormulaSpec {
+                name: "z".into(),
+                expression: "(close-ma(close,2))/std(close,2)".into(),
+            },
+        ];
+        let rows = compute_formula_rows(&store, "RawDailyBar", "000001", &specs, 0, None).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows[0].1[0].is_nan());
+        assert!((rows[1].1[0] - 15.0).abs() < 1e-6);
+        assert!((rows[2].1[0] - 25.0).abs() < 1e-6);
+        assert!((rows[2].1[1] - 0.5).abs() < 1e-6);
+        assert!((rows[2].1[2] - 10.0).abs() < 1e-6);
+        assert!((rows[2].1[3] - 1.0).abs() < 1e-6);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn formula_engine_rejects_unsafe_windows() {
+        let specs = vec![FormulaSpec {
+            name: "bad".into(),
+            expression: "ma(close,0)".into(),
+        }];
+        assert!(compile_formulas("RawDailyBar", &specs)
+            .unwrap_err()
+            .contains("positive integer"));
     }
 
     /// 生产查询路径（scan_eval）的自包含回归：不依赖 python / 外部 fixture。

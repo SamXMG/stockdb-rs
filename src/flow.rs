@@ -132,7 +132,18 @@ fn decode_row(src: &[u8]) -> FlowRow {
     let turnover = get_scaled(src, &mut off, EXTRA_SCALE);
     let vol_ratio = get_scaled(src, &mut off, EXTRA_SCALE);
     let source = src[off];
-    FlowRow { t, main_net, main_pct, xl_net, xl_pct, r0_net, r0_pct, turnover, vol_ratio, source }
+    FlowRow {
+        t,
+        main_net,
+        main_pct,
+        xl_net,
+        xl_pct,
+        r0_net,
+        r0_pct,
+        turnover,
+        vol_ratio,
+        source,
+    }
 }
 
 /// 将一只股票的稀疏资金流写入文件。调用方应保证 `rows` 按 `t` 唯一；
@@ -170,23 +181,38 @@ pub fn read_file(path: &Path) -> io::Result<Vec<FlowRow>> {
     let mut data = Vec::new();
     f.read_to_end(&mut data)?;
     if data.len() < HEADER_LEN || &data[..8] != MAGIC {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid flow magic"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid flow magic",
+        ));
     }
     let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
     let record_len = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
     let n = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
     if version != VERSION || record_len != RECORD_LEN {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported flow format"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unsupported flow format",
+        ));
     }
-    let expected = HEADER_LEN.checked_add(n.checked_mul(RECORD_LEN).ok_or_else(||
-        io::Error::new(io::ErrorKind::InvalidData, "flow row count overflow"))?).ok_or_else(||
-        io::Error::new(io::ErrorKind::InvalidData, "flow file length overflow"))?;
+    let expected = HEADER_LEN
+        .checked_add(
+            n.checked_mul(RECORD_LEN).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "flow row count overflow")
+            })?,
+        )
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "flow file length overflow"))?;
     if data.len() != expected {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "flow file length mismatch"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "flow file length mismatch",
+        ));
     }
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
-        out.push(decode_row(&data[HEADER_LEN + i * RECORD_LEN..HEADER_LEN + (i + 1) * RECORD_LEN]));
+        out.push(decode_row(
+            &data[HEADER_LEN + i * RECORD_LEN..HEADER_LEN + (i + 1) * RECORD_LEN],
+        ));
     }
     Ok(out)
 }

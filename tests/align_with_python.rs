@@ -56,7 +56,11 @@ print(json.dumps(out, ensure_ascii=False))
         .arg(code)
         .output()
         .expect("python3 available");
-    assert!(out.status.success(), "python read failed: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "python read failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let s = String::from_utf8_lossy(&out.stdout);
     serde_json::from_str(s.trim()).expect("json parse")
 }

@@ -15,7 +15,9 @@ fn f64_of(v: &Value) -> f64 {
 }
 
 fn main() {
-    let root = std::env::args().nth(1).expect("usage: overview <root> <code>");
+    let root = std::env::args()
+        .nth(1)
+        .expect("usage: overview <root> <code>");
     let code = std::env::args().nth(2).unwrap_or_else(|| "600000".into());
 
     let store = Store::open(&root).expect("open store");
@@ -56,13 +58,19 @@ fn main() {
     // 3) 前复权
     let qfq = derive_qfq(&bars, &events);
     if let (Some(f), Some(l)) = (qfq.first(), qfq.last()) {
-        println!("前复权: 首 {} close={:.2} -> 末 {} close={:.2}", f.date, f.close, l.date, l.close);
+        println!(
+            "前复权: 首 {} close={:.2} -> 末 {} close={:.2}",
+            f.date, f.close, l.date, l.close
+        );
     }
 
     // 4) 周K 聚合（先 qfq 再聚合，价格连续）
     let weekly = stockdb_rs::view::aggregate_period(&bars, "week", Some(&events));
     println!("周K 共 {} 根", weekly.len());
     if let Some(w) = weekly.last() {
-        println!("最新周K {}: O={:.2} H={:.2} L={:.2} C={:.2}", w.date, w.open, w.high, w.low, w.close);
+        println!(
+            "最新周K {}: O={:.2} H={:.2} L={:.2} C={:.2}",
+            w.date, w.open, w.high, w.low, w.close
+        );
     }
 }

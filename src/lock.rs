@@ -100,9 +100,15 @@ mod tests {
         atomic_write(&target, payload).unwrap();
         assert_eq!(fs::read(&target).unwrap(), payload);
         // 临时文件必须已被清理
-        assert!(!tmp_path_for(&target).exists(), "tmp file should be removed");
+        assert!(
+            !tmp_path_for(&target).exists(),
+            "tmp file should be removed"
+        );
         // atomic_write 单独调用不应生成 sidecar 锁文件（锁由 with_exclusive_lock 负责）
-        assert!(!lock_path_for(&target).exists(), "atomic_write alone must not create a lock file");
+        assert!(
+            !lock_path_for(&target).exists(),
+            "atomic_write alone must not create a lock file"
+        );
 
         // 覆盖写仍原子、内容正确
         let payload2 = b"second-write-ok";
@@ -125,7 +131,10 @@ mod tests {
         let r2 = with_exclusive_lock(&target, || Ok::<u32, io::Error>(2));
         assert_eq!(r2.unwrap(), 2);
         // with_exclusive_lock 必须在 sidecar 上创建锁文件
-        assert!(lock_path_for(&target).exists(), "lock file should be created by with_exclusive_lock");
+        assert!(
+            lock_path_for(&target).exists(),
+            "lock file should be created by with_exclusive_lock"
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }
