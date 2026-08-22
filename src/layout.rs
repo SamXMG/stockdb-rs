@@ -30,6 +30,7 @@ pub const BOOL_FIELDS: &[(&str, &[&str])] = &[
     ("DailySnapshot", &["is_st"]),
     ("Announcement", &[]),
     ("RenameEvent", &[]),
+    ("IndustryDaily", &[]),
 ];
 
 /// 各表字段序列（顺序即落盘顺序）。
@@ -74,6 +75,11 @@ pub const TABLE_FIELDS: &[(&str, &[&str])] = &[
         "pb", "chg60", "flow_main", "flow_main_pct",
         "flow_xl", "flow_xl_pct", "flow_l", "flow_l_pct",
         "industry", "concepts",
+    ]),
+    ("IndustryDaily", &[
+        "code", "t", "date", "industry", "ret_1d", "ret_5d", "ret_20d",
+        "relative_20d", "above_ma20_rate", "advance_rate", "amount_share",
+        "member_count",
     ]),
 ];
 
@@ -122,6 +128,14 @@ pub const SCALED: &[(&str, f64)] = &[
     ("l_pct", 10000.0),
     ("mid_pct", 10000.0),
     ("small_pct", 10000.0),
+    // 行业日强度（收益/占比按 6 位小数保存，member_count 保持 f64）。
+    ("ret_1d", 1_000_000.0),
+    ("ret_5d", 1_000_000.0),
+    ("ret_20d", 1_000_000.0),
+    ("relative_20d", 1_000_000.0),
+    ("above_ma20_rate", 1_000_000.0),
+    ("advance_rate", 1_000_000.0),
+    ("amount_share", 1_000_000.0),
 ];
 
 fn scaled_scale_of(name: &str) -> Option<f64> {
@@ -519,6 +533,7 @@ mod tests {
         assert_eq!(record_len("FundFlow"), Some(95));
         // DailySnapshot: price/prev_close + 9 个百分比/比率列缩放 → 384
         assert_eq!(record_len("DailySnapshot"), Some(384));
+        assert_eq!(record_len("IndustryDaily"), Some(95));
         // CompanyProfile: 303579 / 801 = 379
         assert_eq!(record_len("CompanyProfile"), Some(379));
         // AdjustEvent: 47259 / 801 = 59

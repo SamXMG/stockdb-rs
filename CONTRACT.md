@@ -260,6 +260,8 @@ for _ in range(n_hits):
 
 **DailySnapshot**: `code, date, t, name, board, is_st, price, prev_close, chg_pct, vol_ratio, turnover, market_cap_yi, float_cap_yi, pe, pb, chg60, flow_main, flow_main_pct, flow_xl, flow_xl_pct, flow_l, flow_l_pct, industry, concepts`
 
+**IndustryDaily**: `code, t, date, industry, ret_1d, ret_5d, ret_20d, relative_20d, above_ma20_rate, advance_rate, amount_share, member_count`
+
 ### 3.2 字符串字段宽度 `STR_W`（字节，`\0` 右补齐）
 
 ```
@@ -274,7 +276,7 @@ summary=128, url=64, reason=64, note=64, concepts=192
 
 | 表 | bool 字段 |
 |----|-----------|
-| RawDailyBar / FundFlow / AdjustEvent / IndexDaily / Announcement / RenameEvent | （无） |
+| RawDailyBar / FundFlow / AdjustEvent / IndexDaily / Announcement / RenameEvent / IndustryDaily | （无） |
 | CompanyProfile | `is_st, is_hs300, is_zz500, is_zz1000, is_zz2000, is_finance` |
 | DailySnapshot | `is_st` |
 
@@ -286,6 +288,7 @@ summary=128, url=64, reason=64, note=64, concepts=192
 - `IndexDaily` = 67（价格列 open/high/low/close 改为 `I`）
 - `FundFlow` = 95（5 个 `*_pct` 改为 `I`）
 - `DailySnapshot` = 384（price/prev_close + 9 个百分比/比率列改为 `I`）
+- `IndustryDaily` = 95（行业名 24 字节 + 7 个 6 位小数缩放列 + member_count）
 - `CompanyProfile` = 379（未缩放）
 - `AdjustEvent` = 59（未缩放）
 - 其余各表按 §3.1 字段序列 + §3.2/§3.3 宽度累加（公式见 §4.1）；缩放列按 `I`(4B) 计，其余数值按 `d`(8B)。

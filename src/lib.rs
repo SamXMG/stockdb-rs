@@ -59,7 +59,7 @@ pub use layout::{
 pub fn is_calendar_table(table: &str) -> bool {
     matches!(
         table,
-        "RawDailyBar" | "FundFlow" | "IndexDaily" | "DailySnapshot"
+        "RawDailyBar" | "FundFlow" | "IndexDaily" | "DailySnapshot" | "IndustryDaily"
     )
 }
 
