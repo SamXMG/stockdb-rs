@@ -16,6 +16,7 @@ pub const STR_W: &[(&str, usize)] = &[
     ("ann_type", 16), ("name", 32), ("former_names", 64), ("full_name", 64),
     ("old_name", 32), ("new_name", 32), ("title", 128), ("summary", 128),
     ("url", 64), ("reason", 64), ("note", 64), ("concepts", 192),
+    ("group_id", 16), ("industry_name", 24),
 ];
 
 /// 各表的 bool 字段集合。
@@ -538,5 +539,7 @@ mod tests {
         assert_eq!(record_len("CompanyProfile"), Some(379));
         // AdjustEvent: 47259 / 801 = 59
         assert_eq!(record_len("AdjustEvent"), Some(59));
+        // IndustryDaily: group_id(16)+t(8)+date(10)+industry_name(24)+7×scaled(28)+member_count f64(8)+present(1) = 95
+        assert_eq!(record_len("IndustryDaily"), Some(95));
     }
 }
