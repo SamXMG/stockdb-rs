@@ -222,6 +222,32 @@ impl StockDB {
         })
     }
 
+    /// 实时横截面聚合视图（不落盘）：聚合某 industry/board 在指定 date 的日线指标。
+    /// group_type: "industry" | "board"；name: 行业/板块名；date: yyyy-mm-dd。
+    /// 返回 JSON 字符串（含 ret_1d/ret_5d/ret_20d/relative_20d/above_ma20_rate/
+    /// advance_rate/amount_share/member_count），无数据返回 "{}"。
+    /// 内部按 root 缓存全市场聚合，多次查询复用。
+    #[pyo3(signature = (group_type, name, date, industry_history=None, min_members=3))]
+    fn industry_aggregate(
+        &self,
+        py: Python<'_>,
+        group_type: &str,
+        name: &str,
+        date: &str,
+        industry_history: Option<String>,
+        min_members: usize,
+    ) -> PyResult<String> {
+        let history = industry_history
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.root.join("industry_history.json"));
+        py.allow_threads(|| {
+            crate::context::aggregate_group_daily(
+                &self.inner, group_type, name, date, &history, min_members,
+            )
+            .map_err(PyValueError::new_err)
+        })
+    }
+
     /// 列出标准表下所有 code。
     fn codes(&self, table: &str) -> PyResult<Vec<String>> {
         self.inner

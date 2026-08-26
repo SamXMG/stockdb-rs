@@ -7,9 +7,29 @@ use rayon::prelude::*;
 use serde_json::Value as Json;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::{compact, flow, Record, Store, Value};
+
+/// 模块级全市场聚合缓存：按 (root, industry_history) 缓存最近构建的 MarketAggCache，
+/// 跨多次 `aggregate_group_daily` 复用，避免对同一数据重复全扫 RawDailyBar。
+/// RawDailyBar/行业归属变更后，进程重启即失效（新 key 或 OnceLock 重建）。
+static MARKET_AGG_CACHE: OnceLock<Mutex<HashMap<String, Arc<MarketAggCache>>>> = OnceLock::new();
+
+fn get_or_build_cache(store: &Store, industry_history: &Path) -> Result<Arc<MarketAggCache>, String> {
+    let lock = MARKET_AGG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let root = store.root_dir().display().to_string();
+    // 缓存 key 必须包含 industry_history 路径，否则错误的 history 路径会污染缓存
+    let key = format!("{root}\0{}", industry_history.display());
+    let mut map = lock.lock().map_err(|_| "market agg cache poisoned".to_string())?;
+    if let Some(c) = map.get(&key) {
+        return Ok(c.clone());
+    }
+    let cache = Arc::new(build_market_cache(store, industry_history)?);
+    map.insert(key, cache.clone());
+    Ok(cache)
+}
 
 const COLUMNS: &[&str] = &[
     "flow_main_pct_1d",
@@ -309,4 +329,242 @@ pub fn materialize(
         "industry_history": industry_history,
     }))
     .map_err(|e| e.to_string())
+}
+
+/// 实时横截面聚合视图（Rust 侧，不落盘）。
+///
+/// 从 RawDailyBar 实时聚合某 group_type+name 在指定 date 的行业/板块日线指标，
+/// 口径与 Python ingest_industry_daily.py 完全一致。返回 JSON 字符串（键见下），
+/// group 无数据或未通过 min_members 门槛时返回空 dict 的 JSON "{}"。
+///
+/// 输入:
+///   - store: 已打开的 StockDB（含 RawDailyBar + calendar）
+///   - group_type: "industry" | "board"
+///   - name: 行业名或板块名
+///   - date: yyyy-mm-dd（须在 calendar 内）
+///   - industry_history: 行业归属 JSON 路径（board 聚合可传空，仅 industry 需要）
+///   - min_members: 成员数门槛（默认 3）
+///
+/// 内部按 root 缓存全市场聚合（跨多次查询复用，避免重复全扫 RawDailyBar）；
+/// RawDailyBar 变更后由调用方负责失效（重启/close 后重建）。
+///
+/// 输出 JSON 键: group_id/group_type/name/date/t/member_count/
+///   ret_1d/ret_5d/ret_20d/relative_20d/above_ma20_rate/advance_rate/amount_share
+pub fn aggregate_group_daily(
+    store: &Store,
+    group_type: &str,
+    name: &str,
+    date: &str,
+    industry_history: &Path,
+    min_members: usize,
+) -> Result<String, String> {
+    let min_members = min_members.max(1);
+    let t = store
+        .calendar()
+        .date_to_t(date)
+        .ok_or_else(|| format!("date {date} not in calendar"))?;
+    let cache = get_or_build_cache(store, industry_history)?;
+    // 目标 group 的 id 与成员
+    let target_id = match group_type {
+        "board" => group_id("board", name),
+        _ => group_id("industry", name),
+    };
+    let mut bucket: [f64; 7] = [0.0; 7]; // [count, ret1, ret5, ret20, above, advance, amount]
+    if t < cache.groups.len() {
+        if let Some(b) = cache.groups[t].get(&target_id) {
+            bucket = *b;
+        }
+    }
+    let member_count = bucket[0];
+    if member_count < min_members as f64 {
+        return Ok("{}".to_string());
+    }
+    let ret_1d = bucket[1] / member_count;
+    let ret_5d = bucket[2] / member_count;
+    let ret_20d = bucket[3] / member_count;
+    let benchmark = cache.market_ret20_mean(t);
+    let relative_20d = match benchmark {
+        Some(b) => ret_20d - b,
+        None => f64::NAN,
+    };
+    let market_amount = cache.market_amount.get(t).copied().unwrap_or(0.0);
+    let amount_share = if market_amount > 0.0 {
+        bucket[6] / market_amount
+    } else {
+        f64::NAN
+    };
+    Ok(serde_json::json!({
+        "group_id": target_id,
+        "group_type": group_type,
+        "name": name,
+        "date": date,
+        "t": t,
+        "member_count": member_count as u64,
+        "ret_1d": ret_1d,
+        "ret_5d": ret_5d,
+        "ret_20d": ret_20d,
+        "relative_20d": relative_20d,
+        "above_ma20_rate": bucket[4] / member_count,
+        "advance_rate": bucket[5] / member_count,
+        "amount_share": amount_share,
+    })
+    .to_string())
+}
+
+/// 全市场聚合缓存：按 t 保存每个 group 的累加桶，以及市场级 ret20/amount。
+/// 构建一次可复用于任意 group/date 查询，避免重复全扫 RawDailyBar。
+#[derive(Default)]
+pub struct MarketAggCache {
+    /// groups[t][group_id] = [count, ret1, ret5, ret20, above, advance, amount]
+    groups: Vec<HashMap<String, [f64; 7]>>,
+    /// 市场级 ret20 累加与计数（按 t）
+    market_ret20_sum: Vec<f64>,
+    market_ret20_count: Vec<u64>,
+    market_amount: Vec<f64>,
+}
+
+impl MarketAggCache {
+    fn market_ret20_mean(&self, t: usize) -> Option<f64> {
+        let c = self.market_ret20_count.get(t).copied().unwrap_or(0);
+        if c == 0 {
+            return None;
+        }
+        Some(self.market_ret20_sum.get(t).copied().unwrap_or(0.0) / c as f64)
+    }
+}
+
+fn group_id(group_type: &str, name: &str) -> String {
+    // 与 Python group_id 同规则：group_type + 名（截断/规范化见 ingest 参考实现）。
+    format!("{group_type}_{}", sanitize_group_name(name))
+}
+
+fn sanitize_group_name(name: &str) -> String {
+    // Python group_id 用定宽截断；这里保留完整名（与 manifest 一致即可）。
+    name.trim().to_string()
+}
+
+fn build_market_cache(store: &Store, industry_history: &Path) -> Result<MarketAggCache, String> {
+    let started = Instant::now();
+    let versions = load_versions(industry_history)?;
+    let calendar = store.calendar();
+    let cal_len = calendar.len();
+    let mut groups: Vec<HashMap<String, [f64; 7]>> = (0..cal_len).map(|_| HashMap::new()).collect();
+    let mut market_ret20_sum = vec![0.0; cal_len];
+    let mut market_ret20_count = vec![0u64; cal_len];
+    let mut market_amount = vec![0.0; cal_len];
+
+    let codes = store.codes("RawDailyBar").map_err(|e| e.to_string())?;
+    for code in &codes {
+        let records = store
+            .read_mmap("RawDailyBar", code)
+            .map_err(|e| format!("{code}: {e}"))?;
+        if records.len() < 21 {
+            continue;
+        }
+        let board = board_for_code(code);
+        let board_id = group_id("board", board);
+        let industries = versions.get(code).cloned().unwrap_or_default();
+        for (i, r) in records.iter().enumerate() {
+            let t = r.t as usize;
+            if t >= cal_len {
+                continue;
+            }
+            // 需要 t-20 之前的数据计算 ret20/ma20；不足则跳过该日
+            if i < 20 {
+                continue;
+            }
+            let close = match r.get("RawDailyBar", "close") {
+                Some(Value::F64(v)) => *v,
+                Some(Value::I64(v)) => *v as f64,
+                _ => f64::NAN,
+            };
+            let amount = match r.get("RawDailyBar", "amount") {
+                Some(Value::F64(v)) => *v,
+                Some(Value::I64(v)) => *v as f64,
+                _ => 0.0,
+            };
+            if !close.is_finite() || close <= 0.0 {
+                continue;
+            }
+            let prev = match records[i - 1].get("RawDailyBar", "close") {
+                Some(Value::F64(v)) => *v,
+                Some(Value::I64(v)) => *v as f64,
+                _ => f64::NAN,
+            };
+            let c20 = match records[i - 20].get("RawDailyBar", "close") {
+                Some(Value::F64(v)) => *v,
+                Some(Value::I64(v)) => *v as f64,
+                _ => f64::NAN,
+            };
+            let c5 = if i >= 5 {
+                match records[i - 5].get("RawDailyBar", "close") {
+                    Some(Value::F64(v)) => *v,
+                    Some(Value::I64(v)) => *v as f64,
+                    _ => f64::NAN,
+                }
+            } else {
+                f64::NAN
+            };
+            if !prev.is_finite() || prev <= 0.0 || !c20.is_finite() || c20 <= 0.0 {
+                continue;
+            }
+            // MA20
+            let mut ma20 = 0.0;
+            for j in (i.saturating_sub(19)..=i).rev() {
+                if let Some(cc) = records.get(j) {
+                    match cc.get("RawDailyBar", "close") {
+                        Some(Value::F64(v)) => ma20 += *v,
+                        Some(Value::I64(v)) => ma20 += *v as f64,
+                        _ => {}
+                    }
+                }
+            }
+            ma20 /= 20.0;
+            let ret1 = close / prev - 1.0;
+            let ret5 = if c5.is_finite() && c5 > 0.0 { close / c5 - 1.0 } else { f64::NAN };
+            let ret20 = close / c20 - 1.0;
+            // 板 block（所有成员都计入，含无行业归属的）
+            let b = groups[t].entry(board_id.clone()).or_insert([0.0; 7]);
+            b[0] += 1.0;
+            b[1] += ret1;
+            if ret5.is_finite() {
+                b[2] += ret5;
+            }
+            b[3] += ret20;
+            b[4] += if close >= ma20 { 1.0 } else { 0.0 };
+            b[5] += if close >= prev { 1.0 } else { 0.0 };
+            b[6] += amount;
+            market_ret20_sum[t] += ret20;
+            market_ret20_count[t] += 1;
+            market_amount[t] += amount;
+            // 行业 block（需时点行业归属）
+            // read_mmap 的 record 不含 date 文本, 用 t 从日历反查日期
+            let date_str = calendar.t_to_date(t).unwrap_or("");
+            if let Some(industry) = version_at(&industries, date_str) {
+                let iid = group_id("industry", industry);
+                let ib = groups[t].entry(iid).or_insert([0.0; 7]);
+                ib[0] += 1.0;
+                ib[1] += ret1;
+                if ret5.is_finite() {
+                    ib[2] += ret5;
+                }
+                ib[3] += ret20;
+                ib[4] += if close >= ma20 { 1.0 } else { 0.0 };
+                ib[5] += if close >= prev { 1.0 } else { 0.0 };
+                ib[6] += amount;
+            }
+        }
+    }
+    eprintln!(
+        "[context] MarketAggCache built: {} codes, cal={}, elapsed_ms={}",
+        codes.len(),
+        cal_len,
+        started.elapsed().as_millis()
+    );
+    Ok(MarketAggCache {
+        groups,
+        market_ret20_sum,
+        market_ret20_count,
+        market_amount,
+    })
 }
