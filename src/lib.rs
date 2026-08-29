@@ -21,6 +21,7 @@ pub mod labels;
 pub mod layout;
 pub mod lock;
 pub mod minute;
+pub mod risk_gate;
 pub mod view;
 
 // pyo3 原生绑定（feature-gated）：仅 `cargo build --features pyo3` 时编译，
@@ -40,6 +41,7 @@ use pyo3::types::PyModuleMethods;
 #[pyo3::pymodule]
 fn stockdb_rs(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
     m.add_class::<pyo3_api::StockDB>()?;
+    m.add_class::<pyo3_api::RiskGate>()?;
     Ok(())
 }
 

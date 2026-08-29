@@ -589,5 +589,64 @@ fn minute_bar_to_dict(py: Python<'_>, b: &MinuteBar) -> Py<PyDict> {
 // 注意：真正的模块入口 `#[pymodule] fn stockdb_rs` 放在 crate 根 (lib.rs)，不在此处。
 // 原因：cdylib 的导出表只可靠地收纳 crate 根层级的 #[export_name]/#[no_mangle] 符号；
 // 嵌套模块里的 PyInit_* 会被 rustc 当作无 Rust 调用方的死代码消除，导致 import 时报
-// "does not define module export function (PyInit_stockdb_rs)"。本文件仅承载 StockDB 类
-// 与其方法（feature-gated）。
+// "does not define module export function (PyInit_stockdb_rs)"。本文件承载 StockDB 与
+// RiskGate 两个 pyclass 及其方法（feature-gated）。
+
+/// 硬风控闸门 —— L2 层，一票否决。独立于 StockDB，不持有只读 Store 引用。
+/// 风控规则需要的行情由调用方用 StockDB 读出后塞入 intent.context。
+#[pyclass]
+pub struct RiskGate {
+    inner: crate::risk_gate::RiskState,
+}
+
+#[pymethods]
+impl RiskGate {
+    #[new]
+    fn new(config_path: &str) -> PyResult<Self> {
+        crate::risk_gate::RiskState::open(config_path)
+            .map(|s| RiskGate { inner: s })
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("risk config load failed: {e}")))
+    }
+
+    fn set_positions(&mut self, positions_json: &str) -> PyResult<()> {
+        self.inner
+            .set_positions(positions_json)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn add_blocklist(&mut self, blocklist_json: &str) -> PyResult<()> {
+        self.inner
+            .add_blocklist(blocklist_json)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn evaluate(&mut self, intent_json: &str) -> PyResult<String> {
+        self.inner
+            .evaluate(intent_json)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn commit(&mut self, verdict_json: &str) -> PyResult<()> {
+        self.inner
+            .commit(verdict_json)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn status(&self) -> String {
+        self.inner.status_json()
+    }
+
+    /// 导出审计日志（JSON 数组）。P0b 新增。
+    fn audit(&self) -> String {
+        self.inner.audit_json()
+    }
+
+    fn reload(&mut self, config_path: &str) -> PyResult<()> {
+        self.inner.reload(config_path).map_err(PyIOError::new_err)
+    }
+
+    #[getter]
+    fn config_version(&self) -> u64 {
+        self.inner.config_version()
+    }
+}
