@@ -37,6 +37,8 @@ pub const STR_W: &[(&str, usize)] = &[
     ("concepts", 192),
     ("group_id", 16),
     ("industry_name", 24),
+    ("theme_id", 16),
+    ("theme_name", 24),
     ("factor_id", 64),
     ("label_id", 32),
     ("strategy_id", 32),
@@ -67,6 +69,7 @@ pub const BOOL_FIELDS: &[(&str, &[&str])] = &[
     ("Announcement", &[]),
     ("RenameEvent", &[]),
     ("IndustryDaily", &[]),
+    ("ThemeFlow", &[]),
     ("FactorDaily", &[]),
     ("LabelDaily", &["valid"]),
     ("SignalDaily", &["selected"]),
@@ -214,6 +217,25 @@ pub const TABLE_FIELDS: &[(&str, &[&str])] = &[
             "member_count",
         ],
     ),
+    // 题材(概念板块)级资金流时间序列：与 IndustryDaily 同为按全局 t 对齐的
+    // 定长列式表，key = 题材 ID(同花顺概念代码, 如 885431.TI)。
+    // 口径见 screener_lib/theme_flow.py：strength/cum5 为 ‰(主力净额/成交额)，
+    // ret_1d 复用 1e6 缩放，z 为相对自身 60 日的标准差倍数。
+    (
+        "ThemeFlow",
+        &[
+            "theme_id",
+            "t",
+            "date",
+            "theme_name",
+            "strength",
+            "ret_1d",
+            "cum5",
+            "z",
+            "member_count",
+            "flow_net",
+        ],
+    ),
     // 回测缓存：按 code + 全局 t 对齐，factor/label/signal 通过字符串 ID
     // 支持动态增加，不需要修改 schema 或重写旧因子文件。
     (
@@ -311,6 +333,12 @@ pub const SCALED: &[(&str, f64)] = &[
     ("above_ma20_rate", 1_000_000.0),
     ("advance_rate", 1_000_000.0),
     ("amount_share", 1_000_000.0),
+    // 题材资金流（ThemeFlow）：strength/cum5 为 ‰（3 位小数 → ×1000），
+    // z 为标准差倍数（2 位小数 → ×100）。**注意 SCALED 是按字段名全局生效的**
+    // （不看表名），故这里只能用其他表没用过的字段名；ret_1d 直接复用上面的 1e6。
+    ("strength", 1000.0),
+    ("cum5", 1000.0),
+    ("z", 100.0),
 ];
 
 fn scaled_scale_of(name: &str) -> Option<f64> {
@@ -319,7 +347,15 @@ fn scaled_scale_of(name: &str) -> Option<f64> {
 
 /// 计算某表的单条记录字节长度（含首字节 present）。
 /// 等于 1（present）+ 各字段字节之和，与定长结构计算等价。
+/// 行长。**走 schema 缓存**（原先每行重算：全表遍历 + `to_vec()` 分配，是逐行解码
+/// 开销的 62%）。热路径建议直接持有 `Arc<Schema>` 读 `schema.rlen`，连查表都省掉。
 pub fn record_len(table: &str) -> Option<usize> {
+    schema_arc(table).map(|s| s.rlen)
+}
+
+/// 未缓存的参考实现：仅供测试校验 `Schema::rlen` 与历史口径逐表一致。
+#[cfg(test)]
+fn record_len_slow(table: &str) -> Option<usize> {
     let fields = TABLE_FIELDS.iter().find(|(t, _)| *t == table)?.1;
     let bools: Vec<&str> = BOOL_FIELDS
         .iter()
@@ -341,6 +377,39 @@ pub fn record_len(table: &str) -> Option<usize> {
         }
     }
     Some(n)
+}
+
+#[cfg(test)]
+mod schema_cache_tests {
+    use super::*;
+
+    /// 缓存版 rlen 必须与历史逐表计算口径完全一致，否则所有 .dat 偏移会错。
+    #[test]
+    fn cached_rlen_matches_slow_path() {
+        let mut checked = 0;
+        for (table, _) in TABLE_FIELDS {
+            let fast = record_len(table);
+            let slow = record_len_slow(table);
+            assert_eq!(
+                fast, slow,
+                "rlen mismatch for table {table}: cached={fast:?} slow={slow:?}"
+            );
+            assert!(fast.unwrap() > 1, "{table} rlen should include present byte");
+            checked += 1;
+        }
+        assert!(checked > 0, "TABLE_FIELDS must not be empty");
+    }
+
+    #[test]
+    fn unknown_table_has_no_len() {
+        assert_eq!(record_len("__nope__"), None);
+    }
+
+    /// RawDailyBar 行长是硬契约（Python 侧 decode_raw_bar 也按 71 解）。
+    #[test]
+    fn raw_daily_bar_rlen_is_stable() {
+        assert_eq!(record_len("RawDailyBar"), Some(71));
+    }
 }
 
 /// 解码一行的字段名→类型映射（不含 present）。
@@ -391,6 +460,12 @@ pub struct Schema {
     /// 每个字段在定长 stride 内的字节偏移（present 之后）与类型，
     /// 供字节级 eval 直接按列偏移取 `f64`/`i64`/`bool`/`str`。
     pub offsets: Vec<(usize, FieldKind)>,
+    /// 定长行长（= 1 字节 present + 所有字段宽度之和）。
+    ///
+    /// 与 `offsets` / `index` 一同预计算并随 schema 缓存：**`record_len()` 曾在此缺失，
+    /// 导致 `decode_row` 每行重算一次全表遍历 + `to_vec()` 分配，实测占逐行解码开销的
+    /// 62%（201.7ns / 325.6ns）**。热路径请直接读 `rlen`，不要按表名反复查。
+    pub rlen: usize,
 }
 
 /// 全局 schema 缓存：首次按表构建，之后所有 `decode_row` / `record_layout` 共享。
@@ -435,6 +510,8 @@ fn schema_arc(table: &str) -> Option<Arc<Schema>> {
         layout,
         index,
         offsets,
+        // off 走完所有字段后即为行长（起始的 1 是 present 标记）
+        rlen: off,
     });
     if let Ok(mut g) = map.lock() {
         g.insert(table.to_string(), s.clone());
@@ -715,6 +792,9 @@ mod tests {
         assert_eq!(record_len("AdjustEvent"), Some(59));
         // IndustryDaily: group_id(16)+t(8)+date(10)+industry_name(24)+7×scaled(28)+member_count f64(8)+present(1) = 95
         assert_eq!(record_len("IndustryDaily"), Some(95));
+        // ThemeFlow: theme_id(16)+t(8)+date(10)+theme_name(24)+4×scaled(16)
+        //            +member_count(8)+flow_net(8)+present(1) = 91
+        assert_eq!(record_len("ThemeFlow"), Some(91));
         assert_eq!(record_len("FactorDaily"), Some(91));
         assert_eq!(record_len("LabelDaily"), Some(92));
         assert_eq!(record_len("SignalDaily"), Some(92));

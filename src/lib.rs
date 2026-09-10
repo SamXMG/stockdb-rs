@@ -69,6 +69,7 @@ pub fn is_calendar_table(table: &str) -> bool {
             | "IndexDaily"
             | "DailySnapshot"
             | "IndustryDaily"
+            | "ThemeFlow"
             | "FactorDaily"
             | "LabelDaily"
             | "SignalDaily"
@@ -103,6 +104,66 @@ impl Record {
             .zip(self.fields.iter())
             .map(|((n, _), v)| (n.as_str(), v))
     }
+}
+
+/// 一列按物理槽位对齐的值向量：长度 = 请求的 `[t0, t1)`，空槽为 `None`。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ColumnData {
+    F64(Vec<Option<f64>>),
+    Str(Vec<Option<String>>),
+}
+
+impl ColumnData {
+    #[inline]
+    fn push_none(&mut self) {
+        match self {
+            ColumnData::F64(v) => v.push(None),
+            ColumnData::Str(v) => v.push(None),
+        }
+    }
+}
+
+/// 具名列：`Store::read_columns` 的返回单元。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NamedColumn {
+    pub name: String,
+    pub data: ColumnData,
+}
+
+/// 按列偏移读数值：F64 直读 / T 转 f64 / Scaled 反缩放（哨兵→None）/ Bool 转 0-1。
+#[inline]
+fn col_f64(row: &[u8], off: usize, kind: FieldKind) -> Option<f64> {
+    match kind {
+        FieldKind::F64 => {
+            let b: [u8; 8] = row.get(off..off + 8)?.try_into().ok()?;
+            Some(f64::from_le_bytes(b))
+        }
+        FieldKind::T => {
+            let b: [u8; 8] = row.get(off..off + 8)?.try_into().ok()?;
+            Some(i64::from_le_bytes(b) as f64)
+        }
+        FieldKind::Scaled(scale) => {
+            let b: [u8; 4] = row.get(off..off + 4)?.try_into().ok()?;
+            let raw = i32::from_le_bytes(b);
+            if raw == crate::layout::SCALED_NULL {
+                None
+            } else {
+                Some(raw as f64 / scale)
+            }
+        }
+        FieldKind::Bool => Some(if *row.get(off)? != 0 { 1.0 } else { 0.0 }),
+        _ => None,
+    }
+}
+
+/// 按列偏移读定宽字符串：遇 `\0` 截断后 trim。
+#[inline]
+fn col_str(row: &[u8], off: usize, w: usize) -> Option<String> {
+    let raw = row.get(off..off + w)?;
+    let end = raw.iter().position(|&c| c == 0).unwrap_or(w);
+    std::str::from_utf8(&raw[..end])
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// 列式存储视图 (读写均可)。
@@ -265,6 +326,84 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// **列式区间读（按物理槽位对齐）** —— 回测取数主路径应走这里。
+    ///
+    /// 与 `read` / `read_column` 的关键差异：**返回向量长度恒为 `t1-t0`，空槽为 `None`**，
+    /// 因此第 `i` 个元素严格对应交易日索引 `t0+i`，可与全局日历对齐。
+    /// 旧 `read_column` 会跳过 present=0 的空槽导致长度与物理记录不对齐（Python 侧
+    /// 因此弃用它、退回纯 Python struct 解码），本接口即为此而设。
+    ///
+    /// 行优先单次扫描：一行读入后填充所有请求列，多列共享同一 cache line，
+    /// 且全程不物化 `Record` / `Vec<Value>` / `String`（除请求的 Str 列外）。
+    pub fn read_columns(
+        &self,
+        table: &str,
+        code: &str,
+        fields: &[&str],
+        t0: usize,
+        t1: usize,
+    ) -> std::io::Result<Vec<NamedColumn>> {
+        let schema = crate::layout::schema_ref(table).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unknown table: {table}"),
+            )
+        })?;
+        let rlen = schema.rlen;
+        let mmap = self.mmap_of(table, code)?;
+        let n = mmap.len() / rlen;
+        let start = t0.min(n);
+        let end = t1.min(n);
+        let rows = end.saturating_sub(start);
+
+        // 预解析列偏移：未知字段名直接报错，绝不静默跳过（否则列会错位）。
+        let mut sel: Vec<(usize, FieldKind)> = Vec::with_capacity(fields.len());
+        for &f in fields {
+            let i = schema.index.get(f).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("unknown field '{f}' in table {table}"),
+                )
+            })?;
+            sel.push(schema.offsets[*i]);
+        }
+
+        let mut cols: Vec<ColumnData> = sel
+            .iter()
+            .map(|(_, k)| match k {
+                FieldKind::Str(_) => ColumnData::Str(Vec::with_capacity(rows)),
+                _ => ColumnData::F64(Vec::with_capacity(rows)),
+            })
+            .collect();
+
+        for t in start..end {
+            let base = t * rlen;
+            let row = &mmap[base..base + rlen];
+            let present = row[0] != 0;
+            for (ci, &(off, kind)) in sel.iter().enumerate() {
+                if !present {
+                    cols[ci].push_none();
+                    continue;
+                }
+                match (&mut cols[ci], kind) {
+                    (ColumnData::F64(v), _) => v.push(col_f64(row, off, kind)),
+                    (ColumnData::Str(v), FieldKind::Str(w)) => v.push(col_str(row, off, w)),
+                    // 按 kind 分配容器，数值列不会落到 Str 分支；兜底给 None 而不是 panic
+                    (ColumnData::Str(v), _) => v.push(None),
+                }
+            }
+        }
+
+        Ok(fields
+            .iter()
+            .zip(cols)
+            .map(|(&f, data)| NamedColumn {
+                name: f.to_string(),
+                data,
+            })
+            .collect())
     }
 
     /// 列出某表下所有票代码（目录内的 `*.dat` 文件名，去后缀）。
@@ -616,6 +755,159 @@ impl Store {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod read_columns_tests {
+    use super::*;
+
+    fn rec_with(table: &str, date: &str, close: f64) -> Record {
+        let kinds = layout::field_kinds(table).unwrap();
+        let layout_arc = layout::record_layout(table).unwrap();
+        let fields = kinds
+            .iter()
+            .map(|(n, k)| match (n.as_str(), k) {
+                ("t", _) => Value::I64(0),
+                ("date", _) => Value::Str(date.to_string()),
+                ("close", _) => Value::F64(close),
+                (_, layout::FieldKind::Bool) => Value::Bool(false),
+                (_, layout::FieldKind::Str(_)) => Value::Str(String::new()),
+                _ => Value::Null,
+            })
+            .collect();
+        Record {
+            t: 0,
+            date: date.to_string(),
+            fields,
+            layout: layout_arc,
+        }
+    }
+
+    /// 这两个断言分别对应旧 `read_column` 的两个致命 bug（Python 侧因此弃用它）：
+    /// ① date 等 Str 列恒为 None；② 跳过空槽导致返回长度 ≠ 物理槽位数、无法按 t 对齐。
+    #[test]
+    fn read_columns_is_slot_aligned_and_returns_str() {
+        let root = std::env::temp_dir().join(format!("stockdb-cols-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        store
+            .write(
+                "RawDailyBar",
+                "000001",
+                &[
+                    rec_with("RawDailyBar", "2026-01-05", 11.70),
+                    rec_with("RawDailyBar", "2026-01-06", 99.99),
+                    rec_with("RawDailyBar", "2026-01-07", 12.34),
+                ],
+                Some(4),
+            )
+            .unwrap();
+
+        // 人为把 t=1 的 present 字节清零，制造「中间空槽」（真实场景=停牌/缺数据）
+        let p = root.join("RawDailyBar").join("000001.dat");
+        let rlen = layout::record_len("RawDailyBar").unwrap();
+        let mut buf = std::fs::read(&p).unwrap();
+        buf[rlen] = 0;
+        std::fs::write(&p, &buf).unwrap();
+        let store = Store::open(&root).unwrap(); // 重开，丢弃旧 mmap 缓存
+
+        let cols = store
+            .read_columns("RawDailyBar", "000001", &["date", "close"], 0, 4)
+            .unwrap();
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "date");
+        assert_eq!(cols[1].name, "close");
+
+        // ① Str 列必须正常返回，不是 None
+        let date = match &cols[0].data {
+            ColumnData::Str(v) => v.clone(),
+            _ => panic!("date must be decoded as Str"),
+        };
+        assert_eq!(date[0].as_deref(), Some("2026-01-05"));
+        // ② 中间空槽必须占位 None，而不是被跳过导致后续整体前移
+        assert_eq!(date[1], None, "t=1 空槽必须占位 None（否则长度不对齐）");
+        assert_eq!(date[2].as_deref(), Some("2026-01-07"));
+        assert_eq!(date[3], None, "越界槽补 None");
+        assert_eq!(date.len(), 4, "长度必须恒等于 t1-t0");
+
+        let close = match &cols[1].data {
+            ColumnData::F64(v) => v.clone(),
+            _ => panic!("close must be decoded as F64"),
+        };
+        assert_eq!(close.len(), 4);
+        assert!((close[0].unwrap() - 11.70).abs() < 1e-6);
+        assert_eq!(close[1], None, "空槽的数值列同样占位 None");
+        assert!((close[2].unwrap() - 12.34).abs() < 1e-6);
+
+        // 区间读：长度仍等于区间宽度，且下标相对 t0
+        let sub = store
+            .read_columns("RawDailyBar", "000001", &["close"], 1, 3)
+            .unwrap();
+        let c = match &sub[0].data {
+            ColumnData::F64(v) => v.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(c, vec![None, Some(12.34)], "区间读下标相对 t0=1");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_columns_rejects_unknown_field() {
+        let root = std::env::temp_dir().join(format!("stockdb-cols2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        store
+            .write(
+                "RawDailyBar",
+                "000001",
+                &[rec_with("RawDailyBar", "2026-01-05", 1.0)],
+                None,
+            )
+            .unwrap();
+        let e = store
+            .read_columns("RawDailyBar", "000001", &["no_such_field"], 0, 1)
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 与逐行物化的 `decode_row` 交叉验证：同一槽位两者必须给出同一数值，
+    /// 保证新接口不是"快但错"。
+    #[test]
+    fn read_columns_matches_decode_row() {
+        let root = std::env::temp_dir().join(format!("stockdb-cols3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        store
+            .write(
+                "RawDailyBar",
+                "000001",
+                &[
+                    rec_with("RawDailyBar", "2026-01-05", 11.70),
+                    rec_with("RawDailyBar", "2026-01-06", 12.34),
+                ],
+                None,
+            )
+            .unwrap();
+
+        let cols = store
+            .read_columns("RawDailyBar", "000001", &["close"], 0, 2)
+            .unwrap();
+        let got = match &cols[0].data {
+            ColumnData::F64(v) => v.clone(),
+            _ => unreachable!(),
+        };
+        for t in 0..2 {
+            let rec = store.read_at("RawDailyBar", "000001", t).unwrap().unwrap();
+            let v = match rec.get("RawDailyBar", "close").unwrap() {
+                Value::F64(x) => Some(*x),
+                _ => None,
+            };
+            assert_eq!(got[t], v, "t={t} 列式与行式解码不一致");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
