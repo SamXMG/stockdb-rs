@@ -70,6 +70,7 @@ pub fn is_calendar_table(table: &str) -> bool {
             | "DailySnapshot"
             | "IndustryDaily"
             | "ThemeFlow"
+            | "VolumeProfileDaily"
             | "FactorDaily"
             | "LabelDaily"
             | "SignalDaily"
@@ -537,6 +538,11 @@ impl Store {
                     }
                 }
                 let t = cal.ensure(&r.date) as i64;
+                if t < 0 {
+                    // ensure 周末守卫命中: 该记录无合法槽位, 跳过(不写入,
+                    // 不污染日历)。2026-09-16 起日历拒绝周末幽灵日。
+                    continue;
+                }
                 recs.push(Record {
                     t,
                     date: r.date.clone(),

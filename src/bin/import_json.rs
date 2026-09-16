@@ -75,6 +75,11 @@ fn record(table: &str, obj: &Map<String, J>, date: Option<&str>, t: i64) -> io::
     for (name, kind) in kinds {
         fields.push(if name == "t" {
             Value::I64(t)
+        } else if name == "date" {
+            // date 字段落盘为记录归属交易日(文件名日期), 而非 JSON 内字段:
+            // snapshot JSON 无 date 键, 若取 obj["date"] 会写入空串,
+            // 导致 .dat 中 date 全空、按 date 重建/校验时无法定位。
+            Value::Str(date.unwrap_or_default().to_string())
         } else {
             value_for(kind, obj.get(&name))
         });
