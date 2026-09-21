@@ -70,6 +70,8 @@ pub const BOOL_FIELDS: &[(&str, &[&str])] = &[
     ("RenameEvent", &[]),
     ("IndustryDaily", &[]),
     ("ThemeFlow", &[]),
+    // 成交量剖面（结构层）：4 个布尔判据按 0/1 落 1 字节。
+    ("VolumeProfileDaily", &["in_va60", "in_va250", "in_lvn", "double_poc"]),
     ("FactorDaily", &[]),
     ("LabelDaily", &["valid"]),
     ("SignalDaily", &["selected"]),
@@ -278,6 +280,37 @@ pub const TABLE_FIELDS: &[(&str, &[&str])] = &[
             "selected",
         ],
     ),
+    // 成交量剖面（Volume Profile）结构层特征：每票每日一条，由日线滚动窗口
+    // （W60 短结构 / W250 大结构）自算。口径与设计文档
+    // `Screener/docs/研究/订单流与结构位分析框架_2026-09-11.md` §3/§6.1 一一对应：
+    //   - poc/vah/val 为**价位**（元，×100）；atr14 为容差基准（×100）；
+    //   - dist_*_atr / va60_width_atr 为 ATR 归一化距离（×10000）；
+    //   - poc_volume_share 为 POC bin 量占比（×10000，0~1）；
+    //   - in_va/in_lvn/double_poc 为布尔（各 1 字节）。
+    (
+        "VolumeProfileDaily",
+        &[
+            "code",
+            "t",
+            "date",
+            "poc60",
+            "vah60",
+            "val60",
+            "poc250",
+            "vah250",
+            "val250",
+            "atr14",
+            "dist_poc60_atr",
+            "dist_val250_atr",
+            "va60_width_atr",
+            "poc_volume_share",
+            "near_struct_count",
+            "in_va60",
+            "in_va250",
+            "in_lvn",
+            "double_poc",
+        ],
+    ),
 ];
 
 use std::collections::HashMap;
@@ -339,6 +372,21 @@ pub const SCALED: &[(&str, f64)] = &[
     ("strength", 1000.0),
     ("cum5", 1000.0),
     ("z", 100.0),
+    // 成交量剖面（VolumeProfileDaily）：结构价位为元（2 位小数 → ×100）；
+    // atr14 是波幅基准，2 位小数对低价股过粗（3 元股 ATR≈0.05）→ 3 位小数 ×1000；
+    // dist_*_atr / va60_width_atr 为 ATR 倍数（4 位小数 → ×10000）；
+    // poc_volume_share 为占比（4 位小数 → ×10000，范围 0~1）。
+    ("poc60", 100.0),
+    ("vah60", 100.0),
+    ("val60", 100.0),
+    ("poc250", 100.0),
+    ("vah250", 100.0),
+    ("val250", 100.0),
+    ("atr14", 1000.0),
+    ("dist_poc60_atr", 10000.0),
+    ("dist_val250_atr", 10000.0),
+    ("va60_width_atr", 10000.0),
+    ("poc_volume_share", 10000.0),
 ];
 
 fn scaled_scale_of(name: &str) -> Option<f64> {
@@ -795,6 +843,9 @@ mod tests {
         // ThemeFlow: theme_id(16)+t(8)+date(10)+theme_name(24)+4×scaled(16)
         //            +member_count(8)+flow_net(8)+present(1) = 91
         assert_eq!(record_len("ThemeFlow"), Some(91));
+        // VolumeProfileDaily: code(16)+t(8)+date(10)+7×scaled(28)+4×scaled(16)
+        //                     +near_struct_count f64(8)+4×bool(4)+present(1) = 91
+        assert_eq!(record_len("VolumeProfileDaily"), Some(91));
         assert_eq!(record_len("FactorDaily"), Some(91));
         assert_eq!(record_len("LabelDaily"), Some(92));
         assert_eq!(record_len("SignalDaily"), Some(92));

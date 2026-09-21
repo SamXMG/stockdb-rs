@@ -53,6 +53,8 @@ print(json.dumps(bar.__dict__ if hasattr(bar, "__dict__") else {}))
         .map(|v| MinuteBar {
             code: v["code"].as_str().unwrap().to_string(),
             date: v["date"].as_str().unwrap().to_string(),
+            source: v["source"].as_str().unwrap_or_default().to_string(),
+            ohlc_quality: v["ohlc_quality"].as_str().unwrap_or_default().to_string(),
             minutes: v["minutes"]
                 .as_array()
                 .map(|a| a.iter().map(|x| x.as_f64().unwrap()).collect())
@@ -123,6 +125,8 @@ fn sample(code: &str, date: &str, n: usize) -> MinuteBar {
     MinuteBar {
         code: code.to_string(),
         date: date.to_string(),
+        source: "test".to_string(),
+        ohlc_quality: "real_ohlc".to_string(),
         minutes: minutes.clone(),
         opens: minutes.iter().map(|m| 10.0 + m * 0.1).collect(),
         highs: minutes.iter().map(|m| 10.5 + m * 0.1).collect(),
@@ -137,6 +141,8 @@ fn sample(code: &str, date: &str, n: usize) -> MinuteBar {
 fn eq(a: &MinuteBar, b: &MinuteBar) {
     assert_eq!(a.code, b.code);
     assert_eq!(a.date, b.date);
+    assert_eq!(a.source, b.source);
+    assert_eq!(a.ohlc_quality, b.ohlc_quality);
     assert_eq!(a.minutes.len(), b.minutes.len(), "minutes len");
     for (x, y) in a.minutes.iter().zip(b.minutes.iter()) {
         assert!((x - y).abs() < 1e-9, "minutes {x} {y}");

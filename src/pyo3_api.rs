@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::layout::FieldKind;
 use crate::minute::{MinuteBar, MinuteStore};
-use crate::{Record, Store, Value};
+use crate::{ColumnData, Record, Store, Value};
 use std::path::PathBuf;
 
 #[pyclass]
@@ -84,6 +84,119 @@ impl StockDB {
             Some(Value::I64(x)) => Ok(Some(x as f64)),
             _ => Ok(None),
         }
+    }
+
+    /// **列式区间读（按物理槽位对齐）** —— 回测取数主路径请用这个。
+    ///
+    /// 返回 `{字段名: [值|None, ...]}`，每个列表长度恒为 `t1-t0`，
+    /// 第 `i` 项严格对应交易日索引 `t0+i`（空槽为 `None`），可与全局日历对齐。
+    ///
+    /// 这是 `read_column` 的替代品：后者只返回有效行（跳过空槽→长度与物理记录不对齐），
+    /// 且 date 等 Str 列恒为 None，Python 侧因此弃用并退回自己 struct 解码。
+    /// 字符串列（如 date）在此正常返回 `str`。
+    #[pyo3(signature = (table, code, fields, t0=0, t1=None))]
+    fn read_columns<'py>(
+        &self,
+        table: &str,
+        code: &str,
+        fields: Vec<String>,
+        t0: usize,
+        t1: Option<usize>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+        let cols = self
+            .inner
+            .read_columns(table, code, &refs, t0, t1.unwrap_or(usize::MAX))
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("read_columns failed: {e}")))?;
+        let out = PyDict::new_bound(py);
+        for c in cols {
+            match c.data {
+                ColumnData::F64(v) => out.set_item(c.name, v)?,
+                ColumnData::Str(v) => out.set_item(c.name, v)?,
+            }
+        }
+        Ok(out)
+    }
+
+    /// **列式打包读（给 numpy 零拷贝消费）** —— 追求极致吞吐时用这个。
+    ///
+    /// 与 `read_columns` 数据等价，但**不物化成 Python 对象**：
+    ///
+    /// * `dates`：`i32` 小端数组，值为 `YYYYMMDD`（**空槽记为 0**，需调用方过滤）；
+    /// * `vals`：所有数值列按 `num_fields` 顺序**列优先**连续排布的 `f64` 小端数组，
+    ///   可用 `.reshape(len(num_fields), n)` 还原。
+    ///
+    /// Python 侧 `np.frombuffer(buf, dtype=...)` 即零拷贝得到数组。存在的理由：
+    /// pandas 从 `List[Dict]` / `list` 构造 DataFrame 有 **约 1.1ms/次的固定开销**
+    /// （与行数无关），批量扫描 N 票就白付 N×1.1ms；改从 numpy 数组构造则降到
+    /// 约 0.07ms（实测 20x+）。date 解析也在 Rust 侧完成，省掉 Python 的
+    /// `str.replace` 链式操作（小数据下比纯 Python 列表推导还慢 4x）。
+    #[pyo3(signature = (table, code, fields, t0=0, t1=None))]
+    fn read_columns_packed<'py>(
+        &self,
+        table: &str,
+        code: &str,
+        fields: Vec<String>,
+        t0: usize,
+        t1: Option<usize>,
+        py: Python<'py>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let refs: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+        let cols = self
+            .inner
+            .read_columns(table, code, &refs, t0, t1.unwrap_or(usize::MAX))
+            .map_err(|e| PyErr::new::<PyIOError, _>(format!("read_columns failed: {e}")))?;
+
+        let n = cols
+            .first()
+            .map(|c| match &c.data {
+                ColumnData::F64(v) => v.len(),
+                ColumnData::Str(v) => v.len(),
+            })
+            .unwrap_or(0);
+        let mut dates_buf: Vec<u8> = Vec::with_capacity(n * 4);
+        let mut num_names: Vec<String> = Vec::new();
+        let mut num_cols: Vec<&[Option<f64>]> = Vec::new();
+        let mut has_date = false;
+
+        // 先分派，避免一边借用 cols 一边 push
+        for c in &cols {
+            match &c.data {
+                ColumnData::Str(v) if c.name == "date" => {
+                    has_date = true;
+                    for s in v.iter() {
+                        // 空槽是 None -> 记 0，与 date 解析失败同记号
+                        let ymd = s.as_deref().map(date_str_to_ymd).unwrap_or(0);
+                        dates_buf.extend_from_slice(&ymd.to_le_bytes());
+                    }
+                }
+                ColumnData::F64(v) => {
+                    num_names.push(c.name.clone());
+                    num_cols.push(v.as_slice());
+                }
+                _ => {}
+            }
+        }
+        if !has_date {
+            // 未请求 date 列：填 0，保持长度语义一致
+            dates_buf.extend(std::iter::repeat_n(0u8, n * 4));
+        }
+
+        let mut vals_buf: Vec<u8> = Vec::with_capacity(num_cols.len() * n * 8);
+        for col in &num_cols {
+            for x in col.iter() {
+                // 空槽写 NaN：其 date 为 0 会被调用方过滤，写 NaN 避免 0 被误当有效值
+                vals_buf.extend_from_slice(&x.unwrap_or(f64::NAN).to_le_bytes());
+            }
+        }
+
+        let out = PyDict::new_bound(py);
+        out.set_item("n", n)?;
+        out.set_item("dates", PyBytes::new_bound(py, &dates_buf))?;
+        out.set_item("vals", PyBytes::new_bound(py, &vals_buf))?;
+        out.set_item("num_fields", num_names.clone())?;
+        Ok(out)
     }
 
     /// 执行 DSL 查询，返回命中行 JSON 字符串（与 Store::query 同构）。
@@ -454,6 +567,28 @@ impl StockDB {
     }
 }
 
+/// `"YYYY-MM-DD"` -> `20260909`。空槽/空串/非法字符一律返回 **0**（调用方据此过滤）。
+///
+/// 全程 safe：先检查长度，再逐字节 `is_ascii_digit`，越界与非数字都不会 panic。
+fn date_str_to_ymd(s: &str) -> i32 {
+    let b = s.as_bytes();
+    if b.len() < 10 {
+        return 0;
+    }
+    let mut parts = [0i32; 3];
+    for (k, &(st, en)) in [(0usize, 4usize), (5, 7), (8, 10)].iter().enumerate() {
+        let mut v = 0i32;
+        for &c in &b[st..en] {
+            if !c.is_ascii_digit() {
+                return 0;
+            }
+            v = v * 10 + (c - b'0') as i32;
+        }
+        parts[k] = v;
+    }
+    parts[0] * 10000 + parts[1] * 100 + parts[2]
+}
+
 fn value_to_py(py: Python<'_>, v: &Value) -> PyObject {
     match v {
         Value::F64(f) => {
@@ -556,9 +691,19 @@ fn dict_to_minute_bar(dict: &Bound<'_, PyDict>) -> PyResult<MinuteBar> {
         .get_item("date")?
         .and_then(|v| v.extract::<String>().ok())
         .unwrap_or_default();
+    let source = dict
+        .get_item("source")?
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_default();
+    let ohlc_quality = dict
+        .get_item("ohlc_quality")?
+        .and_then(|v| v.extract::<String>().ok())
+        .unwrap_or_default();
     Ok(MinuteBar {
         code,
         date,
+        source,
+        ohlc_quality,
         minutes: get_vec(dict, "minutes")?,
         opens: get_vec(dict, "opens")?,
         highs: get_vec(dict, "highs")?,
@@ -575,6 +720,8 @@ fn minute_bar_to_dict(py: Python<'_>, b: &MinuteBar) -> Py<PyDict> {
     let d = PyDict::new_bound(py);
     let _ = d.set_item("code", b.code.clone());
     let _ = d.set_item("date", b.date.clone());
+    let _ = d.set_item("source", b.source.clone());
+    let _ = d.set_item("ohlc_quality", b.ohlc_quality.clone());
     let _ = d.set_item("minutes", b.minutes.clone());
     let _ = d.set_item("opens", b.opens.clone());
     let _ = d.set_item("highs", b.highs.clone());

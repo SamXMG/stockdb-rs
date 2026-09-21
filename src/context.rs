@@ -4,13 +4,96 @@
 //! 和版本化行业归属。输出为 CompactFactor，Python 只负责编排和读取。
 
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::{compact, flow, Record, Store, Value};
+
+/// 聚合缓存落盘路径: {root}/cache/market_agg.json。
+/// 2026-09-06: 构建实测 ~150-164s(5794 票 × 2442 日历), 一次性成本却每次
+/// 服务重启后重付 —— 改为构建一次落盘, 后续进程启动按 (cal_len, last_t)
+/// 校验命中直接加载(<1s); RawDailyBar 更新后(日历增长)自动重建并覆盖。
+fn agg_cache_path(store: &Store) -> PathBuf {
+    let mut p = store.root_dir().to_path_buf();
+    p.push("cache");
+    p.push("market_agg.json");
+    p
+}
+
+fn load_agg_cache(store: &Store) -> Option<Arc<MarketAggCache>> {
+    let p = agg_cache_path(store);
+    let raw = std::fs::read(&p).ok()?;
+    let disk: DiskMarketAgg = serde_json::from_slice(&raw).ok()?;
+    let calendar = store.calendar();
+    // 校验: 日历长度与最后索引一致才可信(RawDailyBar 更新会增长日历)
+    if disk.cal_len != calendar.len() || disk.last_t != calendar.len().saturating_sub(1) {
+        eprintln!(
+            "[context] MarketAggCache 磁盘版本过期(cal={} last_t={} vs 现网 cal={} last_t={}), 重建",
+            disk.cal_len, disk.last_t, calendar.len(),
+            calendar.len().saturating_sub(1)
+        );
+        return None;
+    }
+    eprintln!(
+        "[context] MarketAggCache loaded from disk: cal={} groups_buckets={}",
+        disk.cal_len,
+        disk.groups.len()
+    );
+    Some(Arc::new(MarketAggCache::from_disk(disk)))
+}
+
+fn save_agg_cache(store: &Store, cache: &MarketAggCache) -> Result<(), String> {
+    let p = agg_cache_path(store);
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let disk = cache.to_disk(store);
+    let raw = serde_json::to_vec(&disk).map_err(|e| e.to_string())?;
+    std::fs::write(&p, &raw).map_err(|e| e.to_string())?;
+    eprintln!(
+        "[context] MarketAggCache saved: {} bytes -> {}",
+        raw.len(),
+        p.display()
+    );
+    Ok(())
+}
+
+/// 落盘中间结构(与 MarketAggCache 同构, 附日历校验元数据)。
+#[derive(Serialize, Deserialize)]
+struct DiskMarketAgg {
+    cal_len: usize,
+    last_t: usize,
+    groups: Vec<HashMap<String, [f64; 7]>>,
+    market_ret20_sum: Vec<f64>,
+    market_ret20_count: Vec<u64>,
+    market_amount: Vec<f64>,
+}
+
+impl MarketAggCache {
+    fn to_disk(&self, store: &Store) -> DiskMarketAgg {
+        let calendar = store.calendar();
+        DiskMarketAgg {
+            cal_len: calendar.len(),
+            last_t: calendar.len().saturating_sub(1),
+            groups: self.groups.clone(),
+            market_ret20_sum: self.market_ret20_sum.clone(),
+            market_ret20_count: self.market_ret20_count.clone(),
+            market_amount: self.market_amount.clone(),
+        }
+    }
+    fn from_disk(d: DiskMarketAgg) -> Self {
+        MarketAggCache {
+            groups: d.groups,
+            market_ret20_sum: d.market_ret20_sum,
+            market_ret20_count: d.market_ret20_count,
+            market_amount: d.market_amount,
+        }
+    }
+}
 
 /// 模块级全市场聚合缓存：按 (root, industry_history) 缓存最近构建的 MarketAggCache，
 /// 跨多次 `aggregate_group_daily` 复用，避免对同一数据重复全扫 RawDailyBar。
@@ -26,9 +109,27 @@ fn get_or_build_cache(store: &Store, industry_history: &Path) -> Result<Arc<Mark
     if let Some(c) = map.get(&key) {
         return Ok(c.clone());
     }
-    let cache = Arc::new(build_market_cache(store, industry_history)?);
-    map.insert(key, cache.clone());
-    Ok(cache)
+    // 先试磁盘缓存(cal_len/last_t 校验通过才加载), 失效则重建
+    let built = match load_agg_cache(store) {
+        Some(c) => {
+            eprintln!("[context] MarketAggCache 磁盘命中, 跳过全市场聚合构建");
+            c
+        }
+        None => {
+            let started = Instant::now();
+            let c = Arc::new(build_market_cache(store, industry_history)?);
+            eprintln!(
+                "[context] MarketAggCache built: elapsed_ms={}",
+                started.elapsed().as_millis()
+            );
+            if let Err(e) = save_agg_cache(store, &c) {
+                eprintln!("[context] MarketAggCache 落盘失败(不影响使用): {e}");
+            }
+            c
+        }
+    };
+    map.insert(key, built.clone());
+    Ok(built)
 }
 
 const COLUMNS: &[&str] = &[

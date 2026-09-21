@@ -7,11 +7,24 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::lock::atomic_write;
+
+const MINUTE_MAGIC: &[u8; 8] = b"LHMIN001";
+const MINUTE_VERSION: u32 = 1;
+const MINUTE_ROW_LEN: u32 = 8 * 8;
+const MINUTE_HEADER: usize = 8 + 4 + 4 + 8 + 16 + 10 + 32 + 16;
+
 /// 单只票单日分时序列（字段顺序即 JSON 序列化顺序）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MinuteBar {
     pub code: String,
     pub date: String,
+    /// 数据来源，例如 eastmoney_trends2 / tencent_minute。
+    #[serde(default)]
+    pub source: String,
+    /// OHLC 质量：real_ohlc 或 price_only。
+    #[serde(default)]
+    pub ohlc_quality: String,
     /// 每分钟序号 (自开盘起)。
     #[serde(default)]
     pub minutes: Vec<f64>,
@@ -56,9 +69,32 @@ impl MinuteStore {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let s = serde_json::to_string(bar)?;
-        std::fs::write(&p, s)?;
-        Ok(())
+        let n = bar.minutes.len();
+        for column in [&bar.opens, &bar.highs, &bar.lows, &bar.closes,
+                       &bar.volumes, &bar.amounts, &bar.avgs] {
+            if column.len() != n {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "minute columns must have equal lengths",
+                ));
+            }
+        }
+        let mut buf = Vec::with_capacity(MINUTE_HEADER + n * MINUTE_ROW_LEN as usize);
+        buf.extend_from_slice(MINUTE_MAGIC);
+        buf.extend_from_slice(&MINUTE_VERSION.to_le_bytes());
+        buf.extend_from_slice(&MINUTE_ROW_LEN.to_le_bytes());
+        buf.extend_from_slice(&(n as u64).to_le_bytes());
+        push_text(&mut buf, &bar.code, 16);
+        push_text(&mut buf, &bar.date, 10);
+        push_text(&mut buf, &bar.source, 32);
+        push_text(&mut buf, &bar.ohlc_quality, 16);
+        for i in 0..n {
+            for value in [bar.minutes[i], bar.opens[i], bar.highs[i], bar.lows[i],
+                           bar.closes[i], bar.volumes[i], bar.amounts[i], bar.avgs[i]] {
+                buf.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        atomic_write(&p, &buf)
     }
 
     /// 读取单日分时块（与 `write` 对称）；缺块返回 None。
@@ -67,8 +103,16 @@ impl MinuteStore {
         if !p.exists() {
             return Ok(None);
         }
-        let txt = std::fs::read_to_string(&p)?;
-        let bar: MinuteBar = serde_json::from_str(&txt)?;
+        let data = std::fs::read(&p)?;
+        if data.starts_with(MINUTE_MAGIC) {
+            return decode_binary(&data).map(Some);
+        }
+        let txt = String::from_utf8(data).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        let bar: MinuteBar = serde_json::from_str(&txt).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
         Ok(Some(bar))
     }
 
@@ -91,6 +135,51 @@ impl MinuteStore {
     }
 }
 
+fn push_text(buf: &mut Vec<u8>, value: &str, width: usize) {
+    let bytes = value.as_bytes();
+    let end = bytes.len().min(width);
+    buf.extend_from_slice(&bytes[..end]);
+    buf.resize(buf.len() + width - end, 0);
+}
+
+fn decode_text(data: &[u8]) -> String {
+    let end = data.iter().position(|b| *b == 0).unwrap_or(data.len());
+    String::from_utf8_lossy(&data[..end]).trim().to_string()
+}
+
+fn decode_binary(data: &[u8]) -> std::io::Result<MinuteBar> {
+    if data.len() < MINUTE_HEADER || &data[..8] != MINUTE_MAGIC {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid minute magic"));
+    }
+    let version = u32::from_le_bytes(data[8..12].try_into().unwrap());
+    let row_len = u32::from_le_bytes(data[12..16].try_into().unwrap());
+    let n = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
+    if version != MINUTE_VERSION || row_len != MINUTE_ROW_LEN
+        || data.len() != MINUTE_HEADER + n * MINUTE_ROW_LEN as usize {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid minute layout"));
+    }
+    let code = decode_text(&data[24..40]);
+    let date = decode_text(&data[40..50]);
+    let source = decode_text(&data[50..82]);
+    let ohlc_quality = decode_text(&data[82..98]);
+    let mut columns: [Vec<f64>; 8] = std::array::from_fn(|_| Vec::with_capacity(n));
+    let mut offset = MINUTE_HEADER;
+    for _ in 0..n {
+        for column in &mut columns {
+            let value = f64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+            column.push(value);
+            offset += 8;
+        }
+    }
+    Ok(MinuteBar {
+        code, date, source, ohlc_quality,
+        minutes: columns[0].clone(), opens: columns[1].clone(),
+        highs: columns[2].clone(), lows: columns[3].clone(),
+        closes: columns[4].clone(), volumes: columns[5].clone(),
+        amounts: columns[6].clone(), avgs: columns[7].clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +189,8 @@ mod tests {
         MinuteBar {
             code: "600000".into(),
             date: "2023-07-14".into(),
+            source: "test".into(),
+            ohlc_quality: "real_ohlc".into(),
             minutes: minutes.clone(),
             opens: minutes.iter().map(|m| 10.0 + m).collect(),
             highs: minutes.iter().map(|m| 10.0 + m * 2.0).collect(),
